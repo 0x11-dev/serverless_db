@@ -637,10 +637,7 @@ mod tests {
         let len = async_store.len("foo/bar.bin".to_string()).await.unwrap();
         assert_eq!(len, Some(4));
 
-        async_store
-            .delete("foo/bar.bin".to_string())
-            .await
-            .unwrap();
+        async_store.delete("foo/bar.bin".to_string()).await.unwrap();
         assert!(!async_store.exists("foo/bar.bin".to_string()).await.unwrap());
     }
 
@@ -663,10 +660,7 @@ mod tests {
             .await
             .unwrap();
 
-        let objects = async_store
-            .list_prefix("a".to_string())
-            .await
-            .unwrap();
+        let objects = async_store.list_prefix("a".to_string()).await.unwrap();
         assert_eq!(objects.len(), 2);
         assert_eq!(objects[0].key, "a/1.bin");
         assert_eq!(objects[1].key, "a/2.bin");

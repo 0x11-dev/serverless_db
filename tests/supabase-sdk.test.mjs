@@ -24,6 +24,7 @@ const BASE_URL = process.env.SDB_BASE_URL || "http://127.0.0.1:8765";
 const JWT_SECRET = process.env.SDB_JWT_SECRET || "dev-secret-change-me";
 const PROJECT_ID = process.env.SDB_PROJECT_ID || "demo";
 const ANON_KEY = mintJwtLocal("anon", "anon", {}, 315360000);
+let clientCounter = 0;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -71,13 +72,40 @@ async function adminReq(method, path, body) {
 }
 
 function makeClient(token) {
+  clientCounter += 1;
   return createClient(BASE_URL, token, {
     auth: { persistSession: false, autoRefreshToken: false },
+    global: { headers: { "x-forwarded-for": `sdk-client-${clientCounter}` } },
   });
 }
 
 function uniqueEmail() {
   return `test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}@example.com`;
+}
+
+async function refreshWithToken(refreshToken) {
+  return fetch(`${BASE_URL}/auth/v1/token?grant_type=refresh_token`, {
+    method: "POST",
+    headers: {
+      apikey: ANON_KEY,
+      "content-type": "application/json",
+      "x-forwarded-for": `sdk-refresh-${Date.now()}-${Math.random()}`,
+    },
+    body: JSON.stringify({ refresh_token: refreshToken }),
+  });
+}
+
+async function storageReq(method, path, token, body, contentType = "application/json") {
+  const headers = { apikey: token };
+  if (token) {
+    headers.authorization = `Bearer ${token}`;
+  }
+  let payload;
+  if (body !== undefined) {
+    payload = body;
+    headers["content-type"] = contentType;
+  }
+  return fetch(`${BASE_URL}${path}`, { method, headers, body: payload });
 }
 
 // ---------------------------------------------------------------------------
@@ -621,6 +649,48 @@ describe("Supabase JS SDK Compatibility Tests", () => {
       strictEqual(signOutError, null);
     });
 
+    test("signOut revokes the current refresh token", async () => {
+      const email = uniqueEmail();
+      const password = "testpass123";
+
+      const client = makeClient(ANON_KEY);
+      const { data: signupData, error: signupError } = await client.auth.signUp({ email, password });
+      strictEqual(signupError, null);
+      const refreshToken = signupData.session.refresh_token;
+
+      const { error: signOutError } = await client.auth.signOut();
+      strictEqual(signOutError, null);
+
+      const refreshRes = await refreshWithToken(refreshToken);
+      strictEqual(refreshRes.status, 401);
+    });
+
+    test("signOut with local scope preserves other sessions", async () => {
+      const email = uniqueEmail();
+      const password = "testpass123";
+
+      const client1 = makeClient(ANON_KEY);
+      const { data: signupData, error: signupError } = await client1.auth.signUp({ email, password });
+      strictEqual(signupError, null);
+      const session1RefreshToken = signupData.session.refresh_token;
+
+      const client2 = makeClient(ANON_KEY);
+      const { data: signinData, error: signinError } = await client2.auth.signInWithPassword({ email, password });
+      strictEqual(signinError, null);
+      const session2RefreshToken = signinData.session.refresh_token;
+
+      const { error: signOutError } = await client1.auth.signOut({ scope: "local" });
+      strictEqual(signOutError, null);
+
+      const session1Refresh = await refreshWithToken(session1RefreshToken);
+      strictEqual(session1Refresh.status, 401);
+
+      const session2Refresh = await refreshWithToken(session2RefreshToken);
+      strictEqual(session2Refresh.status, 200);
+      const refreshed = await session2Refresh.json();
+      ok(refreshed.refresh_token, "other session should still refresh");
+    });
+
     test("refreshSession with valid refresh token returns new session", async () => {
       const email = uniqueEmail();
       const password = "testpass123";
@@ -715,6 +785,73 @@ describe("Supabase JS SDK Compatibility Tests", () => {
       ok(data.some((b) => b.name === bucketName || b.id === bucketName));
     });
 
+    test("anonymous requests cannot manage buckets", async () => {
+      const createRes = await storageReq(
+        "POST",
+        "/storage/v1/buckets",
+        ANON_KEY,
+        JSON.stringify({ name: `anon_bucket_${Date.now()}` }),
+      );
+      strictEqual(createRes.status, 403);
+
+      const listRes = await storageReq("GET", "/storage/v1/buckets", ANON_KEY);
+      strictEqual(listRes.status, 403);
+
+      const getRes = await storageReq("GET", `/storage/v1/buckets/${bucketName}`, ANON_KEY);
+      strictEqual(getRes.status, 403);
+
+      const deleteRes = await storageReq("DELETE", `/storage/v1/buckets/${bucketName}`, ANON_KEY);
+      strictEqual(deleteRes.status, 403);
+    });
+
+    test("anonymous requests cannot access objects", async () => {
+      await storageReq(
+        "POST",
+        `/storage/v1/object/${bucketName}/anon-negative.txt`,
+        serviceToken,
+        "private",
+        "text/plain",
+      );
+
+      const uploadRes = await storageReq(
+        "POST",
+        `/storage/v1/object/${bucketName}/anon-upload.txt`,
+        ANON_KEY,
+        "nope",
+        "text/plain",
+      );
+      strictEqual(uploadRes.status, 403);
+
+      const listRes = await storageReq(
+        "POST",
+        `/storage/v1/object/list/${bucketName}`,
+        ANON_KEY,
+        JSON.stringify({ limit: 100, offset: 0 }),
+      );
+      strictEqual(listRes.status, 403);
+
+      const downloadRes = await storageReq(
+        "GET",
+        `/storage/v1/object/${bucketName}/anon-negative.txt`,
+        ANON_KEY,
+      );
+      strictEqual(downloadRes.status, 403);
+
+      const deleteRes = await storageReq(
+        "DELETE",
+        `/storage/v1/object/${bucketName}/anon-negative.txt`,
+        ANON_KEY,
+      );
+      strictEqual(deleteRes.status, 403);
+
+      const cleanupRes = await storageReq(
+        "DELETE",
+        `/storage/v1/object/${bucketName}/anon-negative.txt`,
+        serviceToken,
+      );
+      ok(cleanupRes.status === 200 || cleanupRes.status === 204, `cleanup status: ${cleanupRes.status}`);
+    });
+
     test("upload file (raw body)", async () => {
       const res = await fetch(`${BASE_URL}/storage/v1/object/${bucketName}/test-file.txt`, {
         method: "POST",
@@ -757,6 +894,64 @@ describe("Supabase JS SDK Compatibility Tests", () => {
         headers: { authorization: `Bearer ${serviceToken}` },
       });
       ok(res.status === 200 || res.status === 204, `delete status: ${res.status}`);
+    });
+
+    test("authenticated users can access only their own objects", async () => {
+      const alice = makeClient(ANON_KEY);
+      const bob = makeClient(ANON_KEY);
+      const { data: aliceSignup } = await alice.auth.signUp({
+        email: uniqueEmail(),
+        password: "testpass123",
+      });
+      const { data: bobSignup } = await bob.auth.signUp({
+        email: uniqueEmail(),
+        password: "testpass123",
+      });
+      const aliceToken = aliceSignup.session.access_token;
+      const bobToken = bobSignup.session.access_token;
+      const key = `alice-owned-${Date.now()}.txt`;
+
+      const uploadRes = await storageReq(
+        "POST",
+        `/storage/v1/object/${bucketName}/${key}`,
+        aliceToken,
+        "owned by alice",
+        "text/plain",
+      );
+      ok(uploadRes.status === 200 || uploadRes.status === 201, `upload status: ${uploadRes.status}`);
+
+      const aliceDownload = await storageReq("GET", `/storage/v1/object/${bucketName}/${key}`, aliceToken);
+      strictEqual(aliceDownload.status, 200);
+      strictEqual(await aliceDownload.text(), "owned by alice");
+
+      const aliceList = await storageReq(
+        "POST",
+        `/storage/v1/object/list/${bucketName}`,
+        aliceToken,
+        JSON.stringify({ limit: 100, offset: 0 }),
+      );
+      strictEqual(aliceList.status, 200);
+      const aliceObjects = await aliceList.json();
+      ok(aliceObjects.some((f) => f.key === key || f.name === key));
+
+      const bobDownload = await storageReq("GET", `/storage/v1/object/${bucketName}/${key}`, bobToken);
+      strictEqual(bobDownload.status, 403);
+
+      const bobList = await storageReq(
+        "POST",
+        `/storage/v1/object/list/${bucketName}`,
+        bobToken,
+        JSON.stringify({ limit: 100, offset: 0 }),
+      );
+      strictEqual(bobList.status, 200);
+      const bobObjects = await bobList.json();
+      ok(!bobObjects.some((f) => f.key === key || f.name === key));
+
+      const bobDelete = await storageReq("DELETE", `/storage/v1/object/${bucketName}/${key}`, bobToken);
+      strictEqual(bobDelete.status, 403);
+
+      const aliceDelete = await storageReq("DELETE", `/storage/v1/object/${bucketName}/${key}`, aliceToken);
+      ok(aliceDelete.status === 200 || aliceDelete.status === 204, `delete status: ${aliceDelete.status}`);
     });
 
     test("get bucket info", async () => {

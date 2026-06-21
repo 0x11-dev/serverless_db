@@ -1,7 +1,9 @@
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use crate::auth::{actor_from_authorization, is_production, mint_token, verify_token};
+use crate::auth_store::{AuthLogoutScope, AuthUserPatch};
 use crate::postgrest::CountMode;
 use crate::runtime::{ApiError, PolicySpec, ProjectRuntime, TableSpec, WriteIdempotency};
+use argon2::Argon2;
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -9,15 +11,20 @@ use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, options, post, put};
 use axum::{Json, Router};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use rand_core::OsRng;
 use reqwest::Method;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 pub type AppState = Arc<ProjectRuntime>;
+const ACCESS_TOKEN_TTL_SECS: i64 = 3600;
+const REFRESH_TOKEN_TTL_SECS: i64 = 30 * 24 * 60 * 60;
 
 pub fn app(runtime: ProjectRuntime) -> Router {
     let state = Arc::new(runtime);
@@ -74,10 +81,7 @@ pub fn app(runtime: ProjectRuntime) -> Router {
             "/storage/v1/object/list/{bucket_id}",
             post(supabase_list_objects),
         )
-        .route(
-            "/realtime/v1/stream",
-            get(supabase_realtime_stream),
-        )
+        .route("/realtime/v1/stream", get(supabase_realtime_stream))
         .route("/auth/v1/signup", post(auth_signup))
         .route("/auth/v1/token", post(auth_token))
         .route("/auth/v1/logout", post(auth_logout))
@@ -518,6 +522,7 @@ async fn supabase_insert_rows(
     let actor = actor(&headers)?;
     let rows = normalize_supabase_insert_body(body)?;
     let content_type = content_type(&headers);
+    let upsert = prefer_upsert(&headers);
     let mut inserted = Vec::with_capacity(rows.len());
     for (idx, row) in rows.into_iter().enumerate() {
         let idempotency = supabase_write_idempotency(
@@ -528,13 +533,22 @@ async fn supabase_insert_rows(
             &serde_json::to_vec(&row)?,
             idx,
         )?;
-        let value =
-            runtime.insert_row_with_idempotency(&project_id, &table, row, &actor, idempotency)?;
+        let value = if upsert {
+            runtime.upsert_row_with_idempotency(&project_id, &table, row, &actor, idempotency)?
+        } else {
+            runtime.insert_row_with_idempotency(&project_id, &table, row, &actor, idempotency)?
+        };
         if let Some(row) = value.get("row").cloned() {
             inserted.push(row);
         }
     }
-    Ok(supabase_json_with_prefer(Value::Array(inserted), None, &headers, PreferReturn::Default, 0))
+    Ok(supabase_json_with_prefer(
+        Value::Array(inserted),
+        None,
+        &headers,
+        PreferReturn::Default,
+        0,
+    ))
 }
 
 async fn supabase_update_rows(
@@ -554,18 +568,17 @@ async fn supabase_update_rows(
     let actor = actor(&headers)?;
     let filters = supabase_filters(query)?;
     let idempotency = write_idempotency("PATCH", &uri, &headers, "application/json", &body_bytes)?;
-    let value = runtime.update_rows_postgrest(
-        &project_id,
-        &table,
-        &filters,
-        body,
-        &actor,
-        idempotency,
-    )?;
+    let value =
+        runtime.update_rows_postgrest(&project_id, &table, &filters, body, &actor, idempotency)?;
     let affected = value.get("affected").and_then(Value::as_u64).unwrap_or(0) as usize;
-    let rows = value.get("rows").cloned().unwrap_or(Value::Array(Vec::new()));
+    let rows = value
+        .get("rows")
+        .cloned()
+        .unwrap_or(Value::Array(Vec::new()));
     let prefer = prefer_return(&headers);
-    Ok(supabase_json_with_prefer(rows, None, &headers, prefer, affected))
+    Ok(supabase_json_with_prefer(
+        rows, None, &headers, prefer, affected,
+    ))
 }
 
 async fn supabase_delete_rows(
@@ -586,9 +599,14 @@ async fn supabase_delete_rows(
     let value =
         runtime.delete_rows_postgrest(&project_id, &table, &filters, &actor, idempotency)?;
     let affected = value.get("affected").and_then(Value::as_u64).unwrap_or(0) as usize;
-    let rows = value.get("rows").cloned().unwrap_or(Value::Array(Vec::new()));
+    let rows = value
+        .get("rows")
+        .cloned()
+        .unwrap_or(Value::Array(Vec::new()));
     let prefer = prefer_return(&headers);
-    Ok(supabase_json_with_prefer(rows, None, &headers, prefer, affected))
+    Ok(supabase_json_with_prefer(
+        rows, None, &headers, prefer, affected,
+    ))
 }
 
 async fn put_object(
@@ -659,6 +677,7 @@ async fn supabase_create_bucket(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, HttpError> {
+    require_admin(&headers)?;
     let project_id = runtime.supabase_project_id().to_string();
     let name = body
         .get("name")
@@ -679,8 +698,9 @@ async fn supabase_create_bucket(
 
 async fn supabase_list_buckets(
     State(runtime): State<AppState>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, HttpError> {
+    require_admin(&headers)?;
     let project_id = runtime.supabase_project_id().to_string();
     Ok(Json(runtime.list_buckets_async(&project_id).await?))
 }
@@ -688,8 +708,9 @@ async fn supabase_list_buckets(
 async fn supabase_get_bucket(
     State(runtime): State<AppState>,
     Path(bucket_id): Path<String>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, HttpError> {
+    require_admin(&headers)?;
     let project_id = runtime.supabase_project_id().to_string();
     Ok(local_json(
         &runtime,
@@ -703,6 +724,7 @@ async fn supabase_delete_bucket(
     headers: HeaderMap,
 ) -> Result<Json<Value>, HttpError> {
     let project_id = runtime.supabase_project_id().to_string();
+    require_admin(&headers)?;
     let uri = format!("/storage/v1/buckets/{bucket_id}");
     if should_forward_write(&runtime) {
         return forward_json(&runtime, "DELETE", &uri, &headers, Vec::new()).await;
@@ -726,7 +748,7 @@ async fn supabase_upload_object(
     if should_forward_write(&runtime) {
         return forward_json(&runtime, "POST", &uri, &headers, body.to_vec()).await;
     }
-    let actor = actor(&headers)?;
+    let actor = require_storage_actor(&headers)?;
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -753,8 +775,10 @@ async fn supabase_download_object(
     headers: HeaderMap,
 ) -> Result<Response, HttpError> {
     let project_id = runtime.supabase_project_id().to_string();
-    let actor = actor(&headers)?;
-    let object = runtime.get_object_async(&project_id, &bucket_id, &key, &actor).await?;
+    let actor = require_storage_actor(&headers)?;
+    let object = runtime
+        .get_object_async(&project_id, &bucket_id, &key, &actor)
+        .await?;
     let content_type = object
         .meta
         .get("content_type")
@@ -774,11 +798,17 @@ async fn supabase_delete_object(
     if should_forward_write(&runtime) {
         return forward_json(&runtime, "DELETE", &uri, &headers, Vec::new()).await;
     }
-    let actor = actor(&headers)?;
+    let actor = require_storage_actor(&headers)?;
     let idempotency = write_idempotency("DELETE", &uri, &headers, "", &[])?;
     Ok(local_json(
         &runtime,
-        runtime.delete_object_with_idempotency(&project_id, &bucket_id, &key, &actor, idempotency)?,
+        runtime.delete_object_with_idempotency(
+            &project_id,
+            &bucket_id,
+            &key,
+            &actor,
+            idempotency,
+        )?,
     ))
 }
 
@@ -795,17 +825,23 @@ struct SupabaseListObjectsRequest {
 async fn supabase_list_objects(
     State(runtime): State<AppState>,
     Path(bucket_id): Path<String>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     Json(body): Json<SupabaseListObjectsRequest>,
 ) -> Result<Json<Value>, HttpError> {
     let project_id = runtime.supabase_project_id().to_string();
-    Ok(Json(runtime.list_objects_async(
-        &project_id,
-        &bucket_id,
-        body.prefix.as_deref(),
-        body.limit.unwrap_or(100),
-        body.offset.unwrap_or(0),
-    ).await?))
+    let actor = require_storage_actor(&headers)?;
+    Ok(Json(
+        runtime
+            .list_objects_async(
+                &project_id,
+                &bucket_id,
+                body.prefix.as_deref(),
+                body.limit.unwrap_or(100),
+                body.offset.unwrap_or(0),
+                &actor,
+            )
+            .await?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -969,6 +1005,17 @@ fn require_admin(headers: &HeaderMap) -> Result<crate::auth::Actor, HttpError> {
     }
 }
 
+fn require_storage_actor(headers: &HeaderMap) -> Result<crate::auth::Actor, HttpError> {
+    let actor = actor(headers)?;
+    if actor.is_anon() {
+        return Err(HttpError(ApiError::new(
+            403,
+            "storage access requires authenticated or service_role",
+        )));
+    }
+    Ok(actor)
+}
+
 fn filters_and_limit(query: HashMap<String, String>) -> (HashMap<String, String>, u64) {
     let mut filters = HashMap::new();
     let mut limit = 100;
@@ -1042,7 +1089,9 @@ struct SupabaseReadQuery {
     route_region: Option<String>,
 }
 
-fn supabase_filters(query: HashMap<String, String>) -> Result<crate::postgrest::FilterExpr, HttpError> {
+fn supabase_filters(
+    query: HashMap<String, String>,
+) -> Result<crate::postgrest::FilterExpr, HttpError> {
     let pg = crate::postgrest::parse_query_params(&query)
         .map_err(|err| HttpError(ApiError::new(400, err.to_string())))?;
     Ok(pg.filters)
@@ -1084,6 +1133,14 @@ enum PreferReturn {
     Default,
     Minimal,
     Representation,
+}
+
+fn prefer_upsert(headers: &HeaderMap) -> bool {
+    headers
+        .get("prefer")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("resolution=merge-duplicates"))
+        .unwrap_or(false)
 }
 
 fn prefer_count(headers: &HeaderMap) -> CountMode {
@@ -1222,7 +1279,11 @@ fn cors_origin(headers: &HeaderMap) -> String {
     }
 }
 
-fn supabase_json_with_bookmark(value: Value, bookmark: Option<&str>, headers: &HeaderMap) -> Response {
+fn supabase_json_with_bookmark(
+    value: Value,
+    bookmark: Option<&str>,
+    headers: &HeaderMap,
+) -> Response {
     let origin = cors_origin(headers);
     let mut response = (
         [
@@ -1743,10 +1804,107 @@ fn percent_encode(value: &str) -> String {
 // GoTrue-compatible auth endpoints (/auth/v1/*)
 // ---------------------------------------------------------------------------
 
-fn hash_password(password: &str) -> String {
+struct RateLimiter {
+    window_secs: u64,
+    max_requests: usize,
+    buckets: Mutex<HashMap<String, Vec<Instant>>>,
+}
+
+impl RateLimiter {
+    fn new(window_secs: u64, max_requests: usize) -> Self {
+        Self {
+            window_secs,
+            max_requests,
+            buckets: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn check(&self, key: &str) -> bool {
+        let now = Instant::now();
+        let window = std::time::Duration::from_secs(self.window_secs);
+        let mut buckets = self.buckets.lock().unwrap();
+        let entries = buckets.entry(key.to_string()).or_default();
+        entries.retain(|t| now.duration_since(*t) < window);
+        if entries.len() >= self.max_requests {
+            return false;
+        }
+        entries.push(now);
+        true
+    }
+}
+
+static AUTH_RATE_LIMITER: OnceLock<RateLimiter> = OnceLock::new();
+
+fn auth_rate_limiter() -> &'static RateLimiter {
+    AUTH_RATE_LIMITER.get_or_init(|| {
+        let window_secs = std::env::var("SDB_AUTH_RATE_LIMIT_WINDOW_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(60);
+        let max_requests = std::env::var("SDB_AUTH_RATE_LIMIT_MAX")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(10);
+        RateLimiter::new(window_secs, max_requests)
+    })
+}
+
+fn client_ip(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn check_auth_rate_limit(headers: &HeaderMap) -> Result<(), HttpError> {
+    let ip = client_ip(headers);
+    if !auth_rate_limiter().check(&ip) {
+        return Err(HttpError(ApiError::new(
+            429,
+            "Too many auth requests. Please try again later.",
+        )));
+    }
+    Ok(())
+}
+
+fn legacy_sha256_password(password: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(password.as_bytes());
     URL_SAFE_NO_PAD.encode(hasher.finalize())
+}
+
+fn hash_password(password: &str) -> Result<String, HttpError> {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+        .map_err(|err| {
+            HttpError(ApiError::new(
+                500,
+                format!("failed to hash password: {err}"),
+            ))
+        })
+}
+
+fn verify_password(password: &str, hash: &str) -> bool {
+    if !hash.starts_with("$argon2") {
+        return legacy_sha256_password(password) == hash;
+    }
+    let parsed = match PasswordHash::new(hash) {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok()
 }
 
 fn gen_uuid() -> String {
@@ -1765,11 +1923,22 @@ fn gen_uuid() -> String {
     }
     format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        buf[0], buf[1], buf[2], buf[3],
-        buf[4], buf[5],
-        buf[6], buf[7],
-        buf[8], buf[9],
-        buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]
+        buf[0],
+        buf[1],
+        buf[2],
+        buf[3],
+        buf[4],
+        buf[5],
+        buf[6],
+        buf[7],
+        buf[8],
+        buf[9],
+        buf[10],
+        buf[11],
+        buf[12],
+        buf[13],
+        buf[14],
+        buf[15]
     )
 }
 
@@ -1846,29 +2015,29 @@ fn public_user(user: &Value) -> Value {
     out
 }
 
-fn auth_users(state: &AppState) -> std::sync::MutexGuard<'_, HashMap<String, Value>> {
-    state.auth_users().lock().unwrap()
-}
-
-fn auth_refresh_tokens(
-    state: &AppState,
-) -> std::sync::MutexGuard<'_, HashMap<String, Value>> {
-    state.auth_refresh_tokens().lock().unwrap()
-}
-
 fn user_to_json(user: &Value) -> Value {
     user.clone()
 }
 
-fn build_session(user: &Value, state: &AppState) -> Value {
-    let user_id = user
-        .get("id")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    let email = user
-        .get("email")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+fn auth_project_id(state: &AppState) -> String {
+    state.supabase_project_id().to_string()
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn session_response(
+    user: &Value,
+    refresh_token: String,
+    session_id: &str,
+    now: i64,
+) -> Result<Value, HttpError> {
+    let user_id = user.get("id").and_then(Value::as_str).unwrap_or("unknown");
+    let email = user.get("email").and_then(Value::as_str).unwrap_or("");
     let phone = user.get("phone").and_then(Value::as_str);
 
     let access_token = mint_token(
@@ -1877,47 +2046,72 @@ fn build_session(user: &Value, state: &AppState) -> Value {
         {
             let mut m = Map::new();
             m.insert("email".to_string(), Value::String(email.to_string()));
+            m.insert(
+                "session_id".to_string(),
+                Value::String(session_id.to_string()),
+            );
             if let Some(p) = phone {
                 m.insert("phone".to_string(), Value::String(p.to_string()));
             }
             m
         },
-        Some(3600),
+        Some(ACCESS_TOKEN_TTL_SECS),
     )
-    .unwrap_or_default();
+    .map_err(|err| {
+        HttpError(ApiError::new(
+            500,
+            format!("failed to mint access token: {err}"),
+        ))
+    })?;
 
-    let refresh_token = gen_refresh_token();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-
-    {
-        let mut rt = auth_refresh_tokens(state);
-        rt.insert(
-            refresh_token.clone(),
-            json!({
-                "token": refresh_token,
-                "user_id": user_id,
-                "created_at": now,
-            }),
-        );
-    }
-
-    json!({
+    Ok(json!({
         "access_token": access_token,
         "token_type": "bearer",
-        "expires_in": 3600,
-        "expires_at": now + 3600,
+        "expires_in": ACCESS_TOKEN_TTL_SECS,
+        "expires_at": now + ACCESS_TOKEN_TTL_SECS,
         "refresh_token": refresh_token,
         "user": user_to_json(user),
+    }))
+}
+
+fn build_session_with_response(
+    user: &Value,
+    state: &AppState,
+    response_fn: impl FnOnce(&Value, &str, &str, i64) -> Result<Value, HttpError>,
+) -> Result<Value, HttpError> {
+    let user_id = user
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HttpError(ApiError::new(500, "auth user missing id")))?;
+    let refresh_token = gen_refresh_token();
+    let session_id = gen_uuid();
+    let now = now_unix();
+    let expires_at = now + REFRESH_TOKEN_TTL_SECS;
+    let response = response_fn(user, &refresh_token, &session_id, now)?;
+    let project_id = auth_project_id(state);
+    state.auth_issue_refresh_token(
+        &project_id,
+        &refresh_token,
+        user_id,
+        &session_id,
+        now,
+        expires_at,
+    )?;
+    Ok(response)
+}
+
+fn build_session(user: &Value, state: &AppState) -> Result<Value, HttpError> {
+    build_session_with_response(user, state, |user, refresh_token, session_id, now| {
+        session_response(user, refresh_token.to_string(), session_id, now)
     })
 }
 
 async fn auth_signup(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, HttpError> {
+    check_auth_rate_limit(&headers)?;
     let email = body
         .get("email")
         .and_then(Value::as_str)
@@ -1927,22 +2121,13 @@ async fn auth_signup(
         .and_then(Value::as_str)
         .ok_or_else(|| HttpError(ApiError::new(400, "missing password")))?;
 
-    {
-        let users = auth_users(&state);
-        if users.contains_key(email) {
-            return Err(HttpError(ApiError::new(
-                400,
-                "User already registered",
-            )));
-        }
-    }
-
     let now = now_iso();
+    let password_hash = hash_password(password)?;
     let user = json!({
         "id": gen_uuid(),
         "email": email,
         "phone": body.get("phone"),
-        "password_hash": hash_password(password),
+        "password_hash": password_hash,
         "user_metadata": body.get("data").cloned().unwrap_or(json!({})),
         "app_metadata": {},
         "aud": "authenticated",
@@ -1953,20 +2138,20 @@ async fn auth_signup(
         "updated_at": now,
     });
 
-    {
-        let mut users = auth_users(&state);
-        users.insert(email.to_string(), user.clone());
-    }
+    let project_id = auth_project_id(&state);
+    let user = state.auth_create_user(&project_id, user)?;
 
-    let session = build_session(&user, &state);
+    let session = build_session(&user, &state)?;
     Ok(Json(session))
 }
 
 async fn auth_token(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, HttpError> {
+    check_auth_rate_limit(&headers)?;
     let grant_type = query
         .get("grant_type")
         .map(String::as_str)
@@ -1984,25 +2169,20 @@ async fn auth_token(
                 .and_then(Value::as_str)
                 .ok_or_else(|| HttpError(ApiError::new(400, "missing password")))?;
 
-            let pw_hash = hash_password(password);
-            let user = {
-                let users = auth_users(&state);
-                users
-                    .get(email)
-                    .filter(|u| {
-                        u.get("password_hash")
-                            .and_then(Value::as_str)
-                            .map(|h| h == pw_hash)
-                            .unwrap_or(false)
-                    })
-                    .cloned()
-            };
+            let project_id = auth_project_id(&state);
+            let user = state
+                .auth_get_user_by_email_or_phone(&project_id, email)?
+                .filter(|u| {
+                    u.get("password_hash")
+                        .and_then(Value::as_str)
+                        .map(|h| verify_password(password, h))
+                        .unwrap_or(false)
+                });
 
-            let user = user.ok_or_else(|| {
-                HttpError(ApiError::new(401, "Invalid login credentials"))
-            })?;
+            let user =
+                user.ok_or_else(|| HttpError(ApiError::new(401, "Invalid login credentials")))?;
 
-            let session = build_session(&user, &state);
+            let session = build_session(&user, &state)?;
             Ok(Json(session))
         }
         "refresh_token" => {
@@ -2011,46 +2191,66 @@ async fn auth_token(
                 .and_then(Value::as_str)
                 .ok_or_else(|| HttpError(ApiError::new(400, "missing refresh_token")))?;
 
-            let user_id = {
-                let rt = auth_refresh_tokens(&state);
-                rt.get(refresh_token)
-                    .and_then(|e| e.get("user_id"))
-                    .and_then(Value::as_str)
-                    .map(String::from)
-            };
-
-            let user_id = user_id.ok_or_else(|| {
-                HttpError(ApiError::new(401, "Invalid refresh token"))
-            })?;
-
-            let user = {
-                let users = auth_users(&state);
-                users
-                    .values()
-                    .find(|u| {
-                        u.get("id").and_then(Value::as_str) == Some(&user_id)
-                    })
-                    .cloned()
-            };
-
-            let user = user.ok_or_else(|| {
-                HttpError(ApiError::new(401, "User not found"))
-            })?;
-
-            {
-                let mut rt = auth_refresh_tokens(&state);
-                rt.remove(refresh_token);
-            }
-
-            let session = build_session(&user, &state);
+            let new_refresh_token = gen_refresh_token();
+            let now = now_unix();
+            let expires_at = now + REFRESH_TOKEN_TTL_SECS;
+            let project_id = auth_project_id(&state);
+            let current = state.auth_get_active_refresh_token(&project_id, refresh_token, now)?;
+            let session_id = current
+                .get("session_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| HttpError(ApiError::new(500, "refresh token missing session id")))?;
+            let user = current
+                .get("user")
+                .cloned()
+                .ok_or_else(|| HttpError(ApiError::new(500, "refresh token missing user")))?;
+            let session = session_response(&user, new_refresh_token.clone(), session_id, now)?;
+            state.auth_rotate_refresh_token(
+                &project_id,
+                refresh_token,
+                &new_refresh_token,
+                now,
+                expires_at,
+            )?;
             Ok(Json(session))
         }
         _ => Err(HttpError(ApiError::new(400, "unsupported grant_type"))),
     }
 }
 
-async fn auth_logout() -> Result<Json<Value>, HttpError> {
-    Ok(Json(json!({})))
+#[derive(Debug, Deserialize)]
+struct LogoutQuery {
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+fn parse_logout_scope(scope: Option<&str>) -> Result<AuthLogoutScope, HttpError> {
+    match scope.unwrap_or("global") {
+        "global" => Ok(AuthLogoutScope::Global),
+        "local" => Ok(AuthLogoutScope::Local),
+        "others" => Ok(AuthLogoutScope::Others),
+        _ => Err(HttpError(ApiError::new(
+            400,
+            "logout scope must be global, local, or others",
+        ))),
+    }
+}
+
+async fn auth_logout(
+    State(state): State<AppState>,
+    Query(query): Query<LogoutQuery>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, HttpError> {
+    let actor = actor(&headers)?;
+    let user_id = actor
+        .sub
+        .as_deref()
+        .ok_or_else(|| HttpError(ApiError::new(401, "no user associated with token")))?;
+    let scope = parse_logout_scope(query.scope.as_deref())?;
+    let session_id = actor.claims.get("session_id").and_then(Value::as_str);
+    let project_id = auth_project_id(&state);
+    let result = state.auth_revoke_sessions(&project_id, user_id, session_id, scope, now_unix())?;
+    Ok(Json(result))
 }
 
 async fn auth_get_user(
@@ -2063,13 +2263,8 @@ async fn auth_get_user(
         .as_ref()
         .ok_or_else(|| HttpError(ApiError::new(401, "no user associated with token")))?;
 
-    let user = {
-        let users = auth_users(&state);
-        users
-            .values()
-            .find(|u| u.get("id").and_then(Value::as_str) == Some(user_id))
-            .cloned()
-    };
+    let project_id = auth_project_id(&state);
+    let user = state.auth_get_user_by_id(&project_id, user_id)?;
 
     match user {
         Some(u) => Ok(Json(json!({ "user": public_user(&u) }))),
@@ -2088,28 +2283,27 @@ async fn auth_update_user(
         .as_ref()
         .ok_or_else(|| HttpError(ApiError::new(401, "no user associated with token")))?;
 
-    let mut users = auth_users(&state);
-    let email_key = users
-        .iter()
-        .find(|(_, u)| u.get("id").and_then(Value::as_str) == Some(user_id))
-        .map(|(k, _)| k.clone())
-        .ok_or_else(|| HttpError(ApiError::new(404, "User not found")))?;
+    let patch = AuthUserPatch {
+        email: body
+            .get("email")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        phone: body
+            .get("phone")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        password_hash: body
+            .get("password")
+            .and_then(Value::as_str)
+            .map(hash_password)
+            .transpose()?,
+        user_metadata: body.get("data").cloned(),
+        updated_at: now_iso(),
+    };
+    let project_id = auth_project_id(&state);
+    let user = state.auth_update_user(&project_id, user_id, patch)?;
 
-    let user = users.get_mut(&email_key).unwrap();
-    if let Some(email) = body.get("email").and_then(Value::as_str) {
-        user["email"] = Value::String(email.to_string());
-    }
-    if let Some(phone) = body.get("phone").and_then(Value::as_str) {
-        user["phone"] = Value::String(phone.to_string());
-    }
-    if let Some(password) = body.get("password").and_then(Value::as_str) {
-        user["password_hash"] = Value::String(hash_password(password));
-    }
-    if let Some(data) = body.get("data") {
-        user["user_metadata"] = data.clone();
-    }
-
-    Ok(Json(json!({ "user": public_user(user) })))
+    Ok(Json(json!({ "user": public_user(&user) })))
 }
 
 async fn auth_settings() -> Result<Json<Value>, HttpError> {
@@ -2317,12 +2511,26 @@ mod tests {
     }
 
     fn auth_headers() -> HeaderMap {
-        let token = mint_token("alice", "authenticated", Map::new(), None).unwrap();
+        auth_headers_for_sub("alice")
+    }
+
+    fn auth_headers_for_sub(sub: &str) -> HeaderMap {
+        let token = mint_token(sub, "authenticated", Map::new(), None).unwrap();
+        bearer_headers(&token)
+    }
+
+    fn bearer_headers(token: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
-            format!("Bearer {token}").parse().unwrap(),
+            format!("Bearer {}", token).parse().unwrap(),
         );
+        headers
+    }
+
+    fn auth_rate_headers(ip: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", ip.parse().unwrap());
         headers
     }
 
@@ -2758,7 +2966,10 @@ mod tests {
 
         let mut q = HashMap::new();
         q.insert("select".to_string(), "*".to_string());
-        q.insert("or".to_string(), "title.eq.alpha,title.eq.gamma".to_string());
+        q.insert(
+            "or".to_string(),
+            "title.eq.alpha,title.eq.gamma".to_string(),
+        );
         let selected = supabase_select_rows(
             State(runtime.clone()),
             Path("notes".to_string()),
@@ -3163,7 +3374,10 @@ mod tests {
         let err = create_project(
             State(Arc::new(runtime)),
             HeaderMap::new(),
-            Json(ProjectRequest { id: None, project_id: Some("evil".to_string()) }),
+            Json(ProjectRequest {
+                id: None,
+                project_id: Some("evil".to_string()),
+            }),
         )
         .await
         .unwrap_err();
@@ -3261,7 +3475,10 @@ mod tests {
         let err = events(
             State(Arc::new(runtime)),
             Path("demo".to_string()),
-            Query(EventsQuery { since: 0, limit: 100 }),
+            Query(EventsQuery {
+                since: 0,
+                limit: 100,
+            }),
             HeaderMap::new(),
         )
         .await
@@ -3277,7 +3494,10 @@ mod tests {
         let err = events(
             State(Arc::new(runtime)),
             Path("demo".to_string()),
-            Query(EventsQuery { since: 0, limit: 100 }),
+            Query(EventsQuery {
+                since: 0,
+                limit: 100,
+            }),
             auth_headers(),
         )
         .await
@@ -3293,7 +3513,10 @@ mod tests {
         let result = events(
             State(Arc::new(runtime)),
             Path("demo".to_string()),
-            Query(EventsQuery { since: 0, limit: 100 }),
+            Query(EventsQuery {
+                since: 0,
+                limit: 100,
+            }),
             admin_headers(),
         )
         .await;
@@ -3316,6 +3539,306 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auth_logout_local_revokes_only_current_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = ProjectRuntime::new(dir.path().join("r"), RuntimeOptions::default()).unwrap();
+        runtime.create_project("demo").unwrap();
+        let runtime = Arc::new(runtime);
+        let email = "local-logout@example.com";
+        let password = "testpass123";
+
+        let first = auth_signup(
+            State(runtime.clone()),
+            auth_rate_headers("10.0.0.10"),
+            Json(json!({"email": email, "password": password})),
+        )
+        .await
+        .unwrap()
+        .0;
+        let second = auth_token(
+            State(runtime.clone()),
+            auth_rate_headers("10.0.0.11"),
+            Query(HashMap::from([(
+                "grant_type".to_string(),
+                "password".to_string(),
+            )])),
+            Json(json!({"email": email, "password": password})),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let _ = auth_logout(
+            State(runtime.clone()),
+            Query(LogoutQuery {
+                scope: Some("local".to_string()),
+            }),
+            bearer_headers(first["access_token"].as_str().unwrap()),
+        )
+        .await
+        .unwrap();
+
+        let err = auth_token(
+            State(runtime.clone()),
+            auth_rate_headers("10.0.0.12"),
+            Query(HashMap::from([(
+                "grant_type".to_string(),
+                "refresh_token".to_string(),
+            )])),
+            Json(json!({"refresh_token": first["refresh_token"]})),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0.status, 401);
+
+        let refreshed = auth_token(
+            State(runtime.clone()),
+            auth_rate_headers("10.0.0.13"),
+            Query(HashMap::from([(
+                "grant_type".to_string(),
+                "refresh_token".to_string(),
+            )])),
+            Json(json!({"refresh_token": second["refresh_token"]})),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(refreshed["access_token"].as_str().unwrap().len() > 10);
+    }
+
+    #[tokio::test]
+    async fn auth_logout_global_revokes_all_user_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = ProjectRuntime::new(dir.path().join("r"), RuntimeOptions::default()).unwrap();
+        runtime.create_project("demo").unwrap();
+        let runtime = Arc::new(runtime);
+        let email = "global-logout@example.com";
+        let password = "testpass123";
+
+        let first = auth_signup(
+            State(runtime.clone()),
+            auth_rate_headers("10.0.0.20"),
+            Json(json!({"email": email, "password": password})),
+        )
+        .await
+        .unwrap()
+        .0;
+        let second = auth_token(
+            State(runtime.clone()),
+            auth_rate_headers("10.0.0.21"),
+            Query(HashMap::from([(
+                "grant_type".to_string(),
+                "password".to_string(),
+            )])),
+            Json(json!({"email": email, "password": password})),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let _ = auth_logout(
+            State(runtime.clone()),
+            Query(LogoutQuery { scope: None }),
+            bearer_headers(first["access_token"].as_str().unwrap()),
+        )
+        .await
+        .unwrap();
+
+        for (idx, token) in [
+            first["refresh_token"].as_str().unwrap(),
+            second["refresh_token"].as_str().unwrap(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let err = auth_token(
+                State(runtime.clone()),
+                auth_rate_headers(&format!("10.0.0.{}", 22 + idx)),
+                Query(HashMap::from([(
+                    "grant_type".to_string(),
+                    "refresh_token".to_string(),
+                )])),
+                Json(json!({"refresh_token": token})),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.0.status, 401);
+        }
+    }
+
+    #[test]
+    fn failed_session_response_does_not_issue_refresh_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = ProjectRuntime::new(dir.path().join("r"), RuntimeOptions::default()).unwrap();
+        runtime.create_project("demo").unwrap();
+        let runtime = Arc::new(runtime);
+        let user = runtime
+            .auth_create_user(
+                "demo",
+                json!({
+                    "id": "mint-fail-user",
+                    "email": "mint-fail@example.com",
+                    "phone": null,
+                    "password_hash": "pw",
+                    "user_metadata": {},
+                    "app_metadata": {},
+                    "aud": "authenticated",
+                    "role": "authenticated",
+                    "created_at": "2026-06-21T00:00:00Z",
+                    "email_confirmed_at": "2026-06-21T00:00:00Z",
+                    "last_sign_in_at": "2026-06-21T00:00:00Z",
+                    "updated_at": "2026-06-21T00:00:00Z"
+                }),
+            )
+            .unwrap();
+        let err =
+            build_session_with_response(&user, &runtime, |_user, _refresh, _session, _now| {
+                Err(HttpError(ApiError::new(500, "mint failed")))
+            })
+            .unwrap_err();
+        assert_eq!(err.0.status, 500);
+        assert_eq!(
+            runtime
+                .auth_active_refresh_token_count("demo", "mint-fail-user", now_unix())
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn supabase_storage_rejects_anonymous_bucket_management() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = ProjectRuntime::new(dir.path().join("r"), RuntimeOptions::default()).unwrap();
+        runtime.create_project("demo").unwrap();
+        let runtime = Arc::new(runtime);
+
+        let err = supabase_create_bucket(
+            State(runtime.clone()),
+            HeaderMap::new(),
+            Json(json!({"name":"files"})),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0.status, 403);
+
+        let _ = supabase_create_bucket(
+            State(runtime.clone()),
+            admin_headers(),
+            Json(json!({"name":"files"})),
+        )
+        .await
+        .unwrap();
+
+        let err = supabase_list_buckets(State(runtime.clone()), HeaderMap::new())
+            .await
+            .unwrap_err();
+        assert_eq!(err.0.status, 403);
+
+        let err = supabase_get_bucket(
+            State(runtime.clone()),
+            Path("files".to_string()),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0.status, 403);
+
+        let err = supabase_delete_bucket(
+            State(runtime.clone()),
+            Path("files".to_string()),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0.status, 403);
+    }
+
+    #[tokio::test]
+    async fn supabase_storage_enforces_owner_for_object_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = ProjectRuntime::new(dir.path().join("r"), RuntimeOptions::default()).unwrap();
+        runtime.create_project("demo").unwrap();
+        let runtime = Arc::new(runtime);
+
+        let _ = supabase_create_bucket(
+            State(runtime.clone()),
+            admin_headers(),
+            Json(json!({"name":"files"})),
+        )
+        .await
+        .unwrap();
+        let mut alice_upload = auth_headers_for_sub("alice");
+        alice_upload.insert(header::CONTENT_TYPE, "text/plain".parse().unwrap());
+        let _ = supabase_upload_object(
+            State(runtime.clone()),
+            Path(("files".to_string(), "alice.txt".to_string())),
+            alice_upload,
+            Bytes::from("secret"),
+        )
+        .await
+        .unwrap();
+
+        let anon_err = supabase_download_object(
+            State(runtime.clone()),
+            Path(("files".to_string(), "alice.txt".to_string())),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(anon_err.0.status, 403);
+
+        let bob_err = supabase_download_object(
+            State(runtime.clone()),
+            Path(("files".to_string(), "alice.txt".to_string())),
+            auth_headers_for_sub("bob"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(bob_err.0.status, 403);
+
+        let bob_objects = supabase_list_objects(
+            State(runtime.clone()),
+            Path("files".to_string()),
+            auth_headers_for_sub("bob"),
+            Json(SupabaseListObjectsRequest {
+                prefix: None,
+                limit: Some(10),
+                offset: Some(0),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let bob_objects = response_json(bob_objects).await;
+        assert_eq!(bob_objects.as_array().unwrap().len(), 0);
+
+        let alice_objects = supabase_list_objects(
+            State(runtime.clone()),
+            Path("files".to_string()),
+            auth_headers_for_sub("alice"),
+            Json(SupabaseListObjectsRequest {
+                prefix: None,
+                limit: Some(10),
+                offset: Some(0),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let alice_objects = response_json(alice_objects).await;
+        assert_eq!(alice_objects.as_array().unwrap().len(), 1);
+
+        let bob_delete = supabase_delete_object(
+            State(runtime.clone()),
+            Path(("files".to_string(), "alice.txt".to_string())),
+            auth_headers_for_sub("bob"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(bob_delete.0.status, 403);
+    }
+
+    #[tokio::test]
     async fn supabase_storage_bucket_crud() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = ProjectRuntime::new(dir.path().join("r"), RuntimeOptions::default()).unwrap();
@@ -3333,13 +3856,10 @@ mod tests {
         let created = response_json(created).await;
         assert_eq!(created["bucket"], "test_bucket");
 
-        let buckets = supabase_list_buckets(
-            State(runtime.clone()),
-            admin_headers(),
-        )
-        .await
-        .unwrap()
-        .into_response();
+        let buckets = supabase_list_buckets(State(runtime.clone()), admin_headers())
+            .await
+            .unwrap()
+            .into_response();
         let buckets = response_json(buckets).await;
         let arr = buckets.as_array().unwrap();
         assert_eq!(arr.len(), 1);
@@ -3375,7 +3895,7 @@ mod tests {
         runtime.create_project("demo").unwrap();
         let runtime = Arc::new(runtime);
 
-        supabase_create_bucket(
+        let _ = supabase_create_bucket(
             State(runtime.clone()),
             admin_headers(),
             Json(json!({"name":"files"})),
@@ -3404,7 +3924,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let body = axum::body::to_bytes(result.into_body(), 1024).await.unwrap();
+        let body = axum::body::to_bytes(result.into_body(), 1024)
+            .await
+            .unwrap();
         assert_eq!(body.as_ref(), b"hello world");
 
         let objects = supabase_list_objects(
@@ -3453,7 +3975,10 @@ mod tests {
         runtime.create_project("demo").unwrap();
         let err = supabase_realtime_stream(
             State(Arc::new(runtime)),
-            Query(SupabaseRealtimeQuery { since: 0, table: None }),
+            Query(SupabaseRealtimeQuery {
+                since: 0,
+                table: None,
+            }),
             HeaderMap::new(),
         )
         .await
@@ -3487,7 +4012,7 @@ mod tests {
                 },
             ],
         };
-        create_table(
+        let _ = create_table(
             State(runtime.clone()),
             Path("demo".to_string()),
             admin_headers(),
@@ -3496,7 +4021,7 @@ mod tests {
         .await
         .unwrap();
 
-        let mut q = HashMap::new();
+        let q = HashMap::new();
         supabase_insert_rows(
             State(runtime.clone()),
             Path("posts".to_string()),
@@ -3509,14 +4034,19 @@ mod tests {
 
         let response = supabase_realtime_stream(
             State(runtime.clone()),
-            Query(SupabaseRealtimeQuery { since: 0, table: None }),
+            Query(SupabaseRealtimeQuery {
+                since: 0,
+                table: None,
+            }),
             auth_headers(),
         )
         .await
         .unwrap()
         .into_response();
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body_str = String::from_utf8(body.to_vec()).unwrap();
         assert!(body_str.contains("event: insert"));
         assert!(body_str.contains("\"table\":\"posts\""));

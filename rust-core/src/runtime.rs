@@ -1,23 +1,25 @@
 use crate::auth::Actor;
+use crate::auth_store::{
+    AuthLogoutScope, AuthStore, AuthStoreError, AuthStoreWriter, AuthUserPatch,
+};
 use crate::object_store::{AsyncObjectStore, LocalObjectStore, ObjectStoreRef};
-use crate::policy::{compile_policies, evaluate_policies, quote_ident, valid_ident};
+use crate::policy::{compile_policies, evaluate_policies, quote_ident};
 use crate::postgrest::{self, SelectQuery};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use crate::runtime_utils::*;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OptionalExtension, params_from_iter};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
     mpsc,
 };
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 #[derive(Debug, Clone)]
@@ -64,6 +66,19 @@ impl From<serde_json::Error> for ApiError {
 impl From<crate::policy::PolicyError> for ApiError {
     fn from(value: crate::policy::PolicyError) -> Self {
         Self::new(400, value.to_string())
+    }
+}
+
+impl From<AuthStoreError> for ApiError {
+    fn from(value: AuthStoreError) -> Self {
+        match value {
+            AuthStoreError::UserAlreadyRegistered => Self::new(400, "User already registered"),
+            AuthStoreError::UserNotFound => Self::new(404, "User not found"),
+            AuthStoreError::InvalidRefreshToken => Self::new(401, "Invalid refresh token"),
+            AuthStoreError::SessionRequired => Self::new(400, "Session id is required"),
+            AuthStoreError::Sqlite(err) => Self::from(err),
+            AuthStoreError::Json(err) => Self::from(err),
+        }
     }
 }
 
@@ -142,8 +157,6 @@ pub struct ProjectRuntime {
     runtime_id: String,
     states: Arc<Mutex<HashMap<String, Arc<ProjectHandle>>>>,
     notifiers: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
-    auth_users: Arc<Mutex<HashMap<String, serde_json::Value>>>,
-    auth_refresh_tokens: Arc<Mutex<HashMap<String, serde_json::Value>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -281,6 +294,11 @@ enum WriteJobKind {
         data: Value,
         actor: Actor,
     },
+    Upsert {
+        table: String,
+        data: Value,
+        actor: Actor,
+    },
     Update {
         table: String,
         filters: HashMap<String, String>,
@@ -320,6 +338,32 @@ enum WriteJobKind {
     },
     DeleteBucket {
         name: String,
+    },
+    AuthCreateUser {
+        user: Value,
+    },
+    AuthIssueRefreshToken {
+        token: String,
+        user_id: String,
+        session_id: String,
+        created_at: i64,
+        expires_at: i64,
+    },
+    AuthRotateRefreshToken {
+        old_token: String,
+        new_token: String,
+        created_at: i64,
+        expires_at: i64,
+    },
+    AuthRevokeSessions {
+        user_id: String,
+        current_session_id: Option<String>,
+        scope: AuthLogoutScope,
+        revoked_at: i64,
+    },
+    AuthUpdateUser {
+        user_id: String,
+        patch: AuthUserPatch,
     },
 }
 
@@ -405,8 +449,6 @@ impl ProjectRuntime {
             runtime_id: new_runtime_id(),
             states: Arc::new(Mutex::new(HashMap::new())),
             notifiers: Arc::new(Mutex::new(HashMap::new())),
-            auth_users: Arc::new(Mutex::new(HashMap::new())),
-            auth_refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -546,12 +588,125 @@ impl ProjectRuntime {
         &self.options.supabase_project_id
     }
 
-    pub fn auth_users(&self) -> &Arc<Mutex<HashMap<String, serde_json::Value>>> {
-        &self.auth_users
+    pub fn auth_get_user_by_email_or_phone(
+        &self,
+        project_id: &str,
+        identifier: &str,
+    ) -> Result<Option<Value>, ApiError> {
+        let handle = self.ensure_project_for_read(project_id, None)?;
+        let state = handle.state.lock().unwrap();
+        Ok(AuthStore::new(&state.conn).get_user_by_email_or_phone(identifier)?)
     }
 
-    pub fn auth_refresh_tokens(&self) -> &Arc<Mutex<HashMap<String, serde_json::Value>>> {
-        &self.auth_refresh_tokens
+    pub fn auth_get_user_by_id(
+        &self,
+        project_id: &str,
+        user_id: &str,
+    ) -> Result<Option<Value>, ApiError> {
+        let handle = self.ensure_project_for_read(project_id, None)?;
+        let state = handle.state.lock().unwrap();
+        Ok(AuthStore::new(&state.conn).get_user_by_id(user_id)?)
+    }
+
+    pub fn auth_get_active_refresh_token(
+        &self,
+        project_id: &str,
+        token: &str,
+        now: i64,
+    ) -> Result<Value, ApiError> {
+        let handle = self.ensure_project_for_read(project_id, None)?;
+        let state = handle.state.lock().unwrap();
+        Ok(AuthStore::new(&state.conn).get_active_refresh_token(token, now)?)
+    }
+
+    pub fn auth_create_user(&self, project_id: &str, user: Value) -> Result<Value, ApiError> {
+        self.submit_write(project_id, WriteJobKind::AuthCreateUser { user })
+    }
+
+    pub fn auth_issue_refresh_token(
+        &self,
+        project_id: &str,
+        token: &str,
+        user_id: &str,
+        session_id: &str,
+        created_at: i64,
+        expires_at: i64,
+    ) -> Result<Value, ApiError> {
+        self.submit_write(
+            project_id,
+            WriteJobKind::AuthIssueRefreshToken {
+                token: token.to_string(),
+                user_id: user_id.to_string(),
+                session_id: session_id.to_string(),
+                created_at,
+                expires_at,
+            },
+        )
+    }
+
+    pub fn auth_rotate_refresh_token(
+        &self,
+        project_id: &str,
+        old_token: &str,
+        new_token: &str,
+        created_at: i64,
+        expires_at: i64,
+    ) -> Result<Value, ApiError> {
+        self.submit_write(
+            project_id,
+            WriteJobKind::AuthRotateRefreshToken {
+                old_token: old_token.to_string(),
+                new_token: new_token.to_string(),
+                created_at,
+                expires_at,
+            },
+        )
+    }
+
+    pub fn auth_revoke_sessions(
+        &self,
+        project_id: &str,
+        user_id: &str,
+        current_session_id: Option<&str>,
+        scope: AuthLogoutScope,
+        revoked_at: i64,
+    ) -> Result<Value, ApiError> {
+        self.submit_write(
+            project_id,
+            WriteJobKind::AuthRevokeSessions {
+                user_id: user_id.to_string(),
+                current_session_id: current_session_id.map(str::to_string),
+                scope,
+                revoked_at,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub fn auth_active_refresh_token_count(
+        &self,
+        project_id: &str,
+        user_id: &str,
+        now: i64,
+    ) -> Result<i64, ApiError> {
+        let handle = self.ensure_project_for_read(project_id, None)?;
+        let state = handle.state.lock().unwrap();
+        Ok(AuthStore::new(&state.conn).active_refresh_token_count(user_id, now)?)
+    }
+
+    pub fn auth_update_user(
+        &self,
+        project_id: &str,
+        user_id: &str,
+        patch: AuthUserPatch,
+    ) -> Result<Value, ApiError> {
+        self.submit_write(
+            project_id,
+            WriteJobKind::AuthUpdateUser {
+                user_id: user_id.to_string(),
+                patch,
+            },
+        )
     }
 
     pub fn routing_info(&self) -> Value {
@@ -889,8 +1044,7 @@ impl ProjectRuntime {
                             match current {
                                 Ok(Some(lease)) => {
                                     lease.owner_id == self.runtime_id
-                                        && lease.expires_at_ms
-                                            < now + (ttl_ms as u128 / 2)
+                                        && lease.expires_at_ms < now + (ttl_ms as u128 / 2)
                                 }
                                 _ => false,
                             }
@@ -898,15 +1052,11 @@ impl ProjectRuntime {
                     };
                     if needs_renew {
                         if let Err(err) = self.renew_lease(project_id) {
-                            eprintln!(
-                                "[sdb-lease-{project_id}] renew failed: {err}"
-                            );
+                            eprintln!("[sdb-lease-{project_id}] renew failed: {err}");
                         }
                     }
                     if let Err(err) = self.gc_lease_claims(project_id) {
-                        eprintln!(
-                            "[sdb-lease-{project_id}] GC claims failed: {err}"
-                        );
+                        eprintln!("[sdb-lease-{project_id}] GC claims failed: {err}");
                     }
                 }
             }
@@ -943,10 +1093,8 @@ impl ProjectRuntime {
             acquired_at_ms: current.acquired_at_ms,
             expires_at_ms: now + ttl_ms as u128,
         };
-        self.object_store.put_bytes(
-            &key,
-            serde_json::to_vec_pretty(&renewed)?.as_slice(),
-        )?;
+        self.object_store
+            .put_bytes(&key, serde_json::to_vec_pretty(&renewed)?.as_slice())?;
         Ok(())
     }
 
@@ -973,16 +1121,8 @@ impl ProjectRuntime {
         Ok(removed)
     }
 
-    fn audit_lease_conflict(
-        &self,
-        project_id: &str,
-        lease: &WriterLease,
-        reason: &str,
-    ) {
-        let audit_key = format!(
-            "projects/{project_id}/lease-audit-{}.json",
-            now_ms()
-        );
+    fn audit_lease_conflict(&self, project_id: &str, lease: &WriterLease, reason: &str) {
+        let audit_key = format!("projects/{project_id}/lease-audit-{}.json", now_ms());
         let audit = json!({
             "project_id": project_id,
             "runtime_id": self.runtime_id,
@@ -995,7 +1135,9 @@ impl ProjectRuntime {
         self.object_store
             .put_bytes(
                 &audit_key,
-                serde_json::to_vec_pretty(&audit).unwrap_or_default().as_slice(),
+                serde_json::to_vec_pretty(&audit)
+                    .unwrap_or_default()
+                    .as_slice(),
             )
             .ok();
     }
@@ -1675,6 +1817,35 @@ impl ProjectRuntime {
         )
     }
 
+    pub fn upsert_row(
+        &self,
+        project_id: &str,
+        table: &str,
+        data: Value,
+        actor: &Actor,
+    ) -> Result<Value, ApiError> {
+        self.upsert_row_with_idempotency(project_id, table, data, actor, None)
+    }
+
+    pub fn upsert_row_with_idempotency(
+        &self,
+        project_id: &str,
+        table: &str,
+        data: Value,
+        actor: &Actor,
+        idempotency: Option<WriteIdempotency>,
+    ) -> Result<Value, ApiError> {
+        self.submit_write_with_idempotency(
+            project_id,
+            WriteJobKind::Upsert {
+                table: table.to_string(),
+                data,
+                actor: actor.clone(),
+            },
+            idempotency,
+        )
+    }
+
     pub fn update_rows(
         &self,
         project_id: &str,
@@ -1826,9 +1997,12 @@ impl ProjectRuntime {
     }
 
     pub fn delete_bucket(&self, project_id: &str, name: &str) -> Result<Value, ApiError> {
-        self.submit_write(project_id, WriteJobKind::DeleteBucket {
-            name: name.to_string(),
-        })
+        self.submit_write(
+            project_id,
+            WriteJobKind::DeleteBucket {
+                name: name.to_string(),
+            },
+        )
     }
 
     pub fn list_objects(
@@ -1838,7 +2012,9 @@ impl ProjectRuntime {
         prefix: Option<&str>,
         limit: i64,
         offset: i64,
+        actor: &Actor,
     ) -> Result<Value, ApiError> {
+        require_storage_actor(actor)?;
         let handle = self.ensure_project_for_read(project_id, None)?;
         let state = handle.state.lock().unwrap();
         let bucket = assert_user_ident(bucket)?;
@@ -1848,7 +2024,7 @@ impl ProjectRuntime {
             let pattern = format!("{}%", prefix);
             let mut stmt = state.conn.prepare(
                 "SELECT bucket, object_key AS key, size, content_type, etag, owner_id, created_at, updated_at
-                 FROM _sdb_objects WHERE bucket=? AND state='committed' AND object_key LIKE ? 
+                 FROM _sdb_objects WHERE bucket=? AND state='committed' AND object_key LIKE ?
                  ORDER BY object_key LIMIT ? OFFSET ?",
             )?;
             let mapped = stmt.query_map(
@@ -1866,17 +2042,19 @@ impl ProjectRuntime {
                  FROM _sdb_objects WHERE bucket=? AND state='committed'
                  ORDER BY object_key LIMIT ? OFFSET ?",
             )?;
-            let mapped = stmt.query_map(
-                rusqlite::params![bucket, limit, offset],
-                row_to_json_map,
-            )?;
+            let mapped =
+                stmt.query_map(rusqlite::params![bucket, limit, offset], row_to_json_map)?;
             let mut v = Vec::new();
             for r in mapped {
                 v.push(r?);
             }
             v
         };
-        Ok(json!(rows))
+        let visible = rows
+            .into_iter()
+            .filter(|row| storage_object_visible(row, actor))
+            .collect::<Vec<_>>();
+        Ok(json!(visible))
     }
 
     pub fn put_object(
@@ -1934,18 +2112,7 @@ impl ProjectRuntime {
             )
             .optional()?
             .ok_or_else(|| ApiError::new(404, "object not found"))?;
-        if !actor.is_admin() {
-            let owner_id = meta.get("owner_id").and_then(Value::as_str).unwrap_or("");
-            if !owner_id.is_empty() {
-                if let Some(sub) = &actor.sub {
-                    if sub != owner_id {
-                        return Err(ApiError::new(403, "access denied: object not owned by actor"));
-                    }
-                } else {
-                    return Err(ApiError::new(403, "access denied: anonymous access to owned object"));
-                }
-            }
-        }
+        authorize_storage_object(&meta, actor)?;
         let data = self
             .object_store
             .read_bytes(&storage_key(&state.project_id, bucket, key))?;
@@ -1976,18 +2143,7 @@ impl ProjectRuntime {
                 )
                 .optional()?
                 .ok_or_else(|| ApiError::new(404, "object not found"))?;
-            if !actor.is_admin() {
-                let owner_id = meta.get("owner_id").and_then(Value::as_str).unwrap_or("");
-                if !owner_id.is_empty() {
-                    if let Some(sub) = &actor.sub {
-                        if sub != owner_id {
-                            return Err(ApiError::new(403, "access denied: object not owned by actor"));
-                        }
-                    } else {
-                        return Err(ApiError::new(403, "access denied: anonymous access to owned object"));
-                    }
-                }
-            }
+            authorize_storage_object(&meta, actor)?;
             let skey = storage_key(&state.project_id, &bucket, &key);
             (Value::Object(meta), skey)
         };
@@ -2027,13 +2183,22 @@ impl ProjectRuntime {
         prefix: Option<&str>,
         limit: i64,
         offset: i64,
+        actor: &Actor,
     ) -> Result<Value, ApiError> {
         let runtime = self.clone();
         let project_id = project_id.to_string();
         let bucket = bucket.to_string();
         let prefix = prefix.map(|p| p.to_string());
+        let actor = actor.clone();
         tokio::task::spawn_blocking(move || {
-            runtime.list_objects(&project_id, &bucket, prefix.as_deref(), limit, offset)
+            runtime.list_objects(
+                &project_id,
+                &bucket,
+                prefix.as_deref(),
+                limit,
+                offset,
+                &actor,
+            )
         })
         .await
         .map_err(|err| ApiError::new(500, format!("list_objects_async join error: {err}")))?
@@ -2402,6 +2567,9 @@ impl ProjectRuntime {
             WriteJobKind::Insert { table, data, actor } => self
                 .execute_insert(state, &table, data, &actor)
                 .map(|value| (value, true)),
+            WriteJobKind::Upsert { table, data, actor } => self
+                .execute_upsert(state, &table, data, &actor)
+                .map(|value| (value, true)),
             WriteJobKind::Update {
                 table,
                 filters,
@@ -2439,23 +2607,70 @@ impl ProjectRuntime {
             WriteJobKind::DeleteObject { bucket, key, actor } => {
                 self.execute_delete_object(state, &bucket, &key, &actor)
             }
-            WriteJobKind::DeleteBucket { name } => {
-                (|| {
-                    let bucket = assert_user_ident(&name)?;
-                    let tx = state.conn.transaction()?;
-                    let count: i64 = tx.query_row(
-                        "SELECT COUNT(*) FROM _sdb_objects WHERE bucket=? AND state='committed'",
-                        [&bucket],
-                        |row| row.get(0),
-                    )?;
-                    if count > 0 {
-                        return Err(ApiError::new(409, "bucket not empty"));
-                    }
-                    tx.execute("DELETE FROM _sdb_buckets WHERE name=?", [&bucket])?;
-                    tx.commit()?;
-                    Ok(json!({ "deleted": true }))
-                })()
-                .map(|value| (value, true))
+            WriteJobKind::DeleteBucket { name } => (|| {
+                let bucket = assert_user_ident(&name)?;
+                let tx = state.conn.transaction()?;
+                let count: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM _sdb_objects WHERE bucket=? AND state='committed'",
+                    [&bucket],
+                    |row| row.get(0),
+                )?;
+                if count > 0 {
+                    return Err(ApiError::new(409, "bucket not empty"));
+                }
+                tx.execute("DELETE FROM _sdb_buckets WHERE name=?", [&bucket])?;
+                tx.commit()?;
+                Ok(json!({ "deleted": true }))
+            })()
+            .map(|value| (value, true)),
+            WriteJobKind::AuthCreateUser { user } => AuthStoreWriter::new(&mut state.conn)
+                .create_user(user)
+                .map(|user| (user, true))
+                .map_err(ApiError::from),
+            WriteJobKind::AuthIssueRefreshToken {
+                token,
+                user_id,
+                session_id,
+                created_at,
+                expires_at,
+            } => AuthStoreWriter::new(&mut state.conn)
+                .issue_refresh_token(&token, &user_id, &session_id, created_at, expires_at)
+                .map(|()| {
+                    (
+                        json!({
+                            "token": token,
+                            "user_id": user_id,
+                            "session_id": session_id,
+                            "created_at": created_at,
+                            "expires_at": expires_at
+                        }),
+                        true,
+                    )
+                })
+                .map_err(ApiError::from),
+            WriteJobKind::AuthRotateRefreshToken {
+                old_token,
+                new_token,
+                created_at,
+                expires_at,
+            } => AuthStoreWriter::new(&mut state.conn)
+                .rotate_refresh_token(&old_token, &new_token, created_at, expires_at)
+                .map(|session| (session, true))
+                .map_err(ApiError::from),
+            WriteJobKind::AuthRevokeSessions {
+                user_id,
+                current_session_id,
+                scope,
+                revoked_at,
+            } => AuthStoreWriter::new(&mut state.conn)
+                .revoke_sessions(&user_id, current_session_id.as_deref(), scope, revoked_at)
+                .map(|revoked| (json!({ "revoked_sessions": revoked }), revoked > 0))
+                .map_err(ApiError::from),
+            WriteJobKind::AuthUpdateUser { user_id, patch } => {
+                AuthStoreWriter::new(&mut state.conn)
+                    .update_user(&user_id, patch)
+                    .map(|user| (user, true))
+                    .map_err(ApiError::from)
             }
         };
         match result {
@@ -2581,6 +2796,138 @@ impl ProjectRuntime {
         record_event(&tx, table, "insert", &inserted, actor)?;
         tx.commit()?;
         Ok(json!({ "row": inserted }))
+    }
+
+    fn execute_upsert(
+        &self,
+        state: &mut ProjectState,
+        table: &str,
+        data: Value,
+        actor: &Actor,
+    ) -> Result<Value, ApiError> {
+        let table = assert_user_ident(table)?;
+        require_table(&state.conn, table)?;
+        let row = normalize_row_payload(data)?;
+
+        let pk_columns = table_primary_key_columns(&state.conn, table)?;
+        if pk_columns.is_empty() {
+            return Err(ApiError::new(
+                400,
+                "upsert requires a primary key on the table",
+            ));
+        }
+
+        let insert_rules = policy_rules(&state.conn, table, "insert")?;
+        let update_rules = policy_rules(&state.conn, table, "update")?;
+        if !evaluate_policies(&insert_rules, &row, actor)
+            .map_err(|err| ApiError::new(400, err.to_string()))?
+        {
+            return Err(ApiError::new(403, "insert rejected by policy"));
+        }
+
+        let columns: Vec<String> = row
+            .keys()
+            .map(|key| assert_user_ident(key).map(str::to_string))
+            .collect::<Result<Vec<_>, _>>()?;
+        let values: Vec<SqlValue> = columns
+            .iter()
+            .map(|column| json_to_sql_value(row.get(column).unwrap_or(&Value::Null)))
+            .collect();
+
+        let pk_filter_values: Vec<SqlValue> = pk_columns
+            .iter()
+            .map(|col| json_to_sql_value(row.get(col).unwrap_or(&Value::Null)))
+            .collect();
+
+        let tx = state.conn.transaction()?;
+
+        let existing_rowid: Option<i64> = {
+            let where_clause = pk_columns
+                .iter()
+                .map(|col| quote_ident(col).map(|quoted| format!("{quoted} = ?")))
+                .collect::<Result<Vec<_>, _>>()?
+                .join(" AND ");
+            let sql = format!(
+                "SELECT rowid FROM {} WHERE {} LIMIT 1",
+                quote_ident(table)?,
+                where_clause
+            );
+            tx.query_row(&sql, params_from_iter(pk_filter_values.iter()), |row| {
+                row.get::<_, i64>(0)
+            })
+            .optional()?
+        };
+
+        let is_update = existing_rowid.is_some();
+        if is_update {
+            if !evaluate_policies(&update_rules, &row, actor)
+                .map_err(|err| ApiError::new(400, err.to_string()))?
+            {
+                return Err(ApiError::new(403, "update rejected by policy"));
+            }
+        }
+
+        let conflict_target = pk_columns
+            .iter()
+            .map(|col| quote_ident(col))
+            .collect::<Result<Vec<_>, _>>()?
+            .join(", ");
+        let update_set = columns
+            .iter()
+            .filter(|col| !pk_columns.contains(col))
+            .map(|col| {
+                let quoted = quote_ident(col)?;
+                Ok(format!("{quoted}=excluded.{quoted}"))
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?
+            .join(", ");
+
+        let column_list = columns
+            .iter()
+            .map(|col| quote_ident(col))
+            .collect::<Result<Vec<_>, _>>()?
+            .join(",");
+        let placeholders = columns.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+
+        let sql = if update_set.is_empty() {
+            format!(
+                "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT({}) DO NOTHING",
+                quote_ident(table)?,
+                column_list,
+                placeholders,
+                conflict_target
+            )
+        } else {
+            format!(
+                "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT({}) DO UPDATE SET {}",
+                quote_ident(table)?,
+                column_list,
+                placeholders,
+                conflict_target,
+                update_set
+            )
+        };
+        tx.execute(&sql, params_from_iter(values))?;
+
+        let result_row = if let Some(rowid) = existing_rowid {
+            tx.query_row(
+                &format!("SELECT * FROM {} WHERE rowid=?", quote_ident(table)?),
+                [rowid],
+                row_to_json_map,
+            )?
+        } else {
+            let rowid = tx.last_insert_rowid();
+            tx.query_row(
+                &format!("SELECT * FROM {} WHERE rowid=?", quote_ident(table)?),
+                [rowid],
+                row_to_json_map,
+            )?
+        };
+
+        let operation = if is_update { "update" } else { "insert" };
+        record_event(&tx, table, operation, &result_row, actor)?;
+        tx.commit()?;
+        Ok(json!({ "row": result_row }))
     }
 
     fn execute_update(
@@ -2901,6 +3248,7 @@ impl ProjectRuntime {
         content_type: &str,
         actor: &Actor,
     ) -> Result<Value, ApiError> {
+        require_storage_actor(actor)?;
         let bucket = assert_user_ident(bucket)?;
         let key = safe_object_key(key)?;
         require_bucket(&state.conn, bucket)?;
@@ -2956,6 +3304,7 @@ impl ProjectRuntime {
             )
             .optional()?
             .ok_or_else(|| ApiError::new(404, "object not found"))?;
+        authorize_storage_object(&meta, actor)?;
         let tx = state.conn.transaction()?;
         tx.execute(
             "UPDATE _sdb_objects SET state='deleting', updated_at=datetime('now') WHERE bucket=? AND object_key=?",
@@ -3063,6 +3412,7 @@ impl ProjectRuntime {
             );
             ",
         )?;
+        crate::auth_store::ensure_schema(conn)?;
         Ok(())
     }
 
@@ -3283,10 +3633,20 @@ impl ProjectRuntime {
                 ));
             }
         }
-        self.object_store.put_bytes(
-            &manifest_key(&manifest.project_id),
-            serde_json::to_vec_pretty(&manifest)?.as_slice(),
-        )?;
+        let key = manifest_key(&manifest.project_id);
+        let data = serde_json::to_vec_pretty(manifest)?;
+        self.object_store.put_bytes(&key, &data)?;
+        if let Ok(Some(post_write)) = self.load_manifest(&manifest.project_id) {
+            if post_write.generation != manifest.generation {
+                return Err(ApiError::new(
+                    409,
+                    format!(
+                        "manifest generation conflict detected after write: expected={}, found={}; concurrent writer detected",
+                        manifest.generation, post_write.generation
+                    ),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -3413,59 +3773,17 @@ fn table_columns(conn: &Connection, table: &str) -> Result<Vec<Value>, ApiError>
     Ok(rows)
 }
 
-fn row_to_json_map(row: &rusqlite::Row<'_>) -> rusqlite::Result<Map<String, Value>> {
-    let mut out = Map::new();
-    let row_ref = row.as_ref();
-    for idx in 0..row_ref.column_count() {
-        let name = row_ref.column_name(idx)?.to_string();
-        let value: SqlValue = row.get(idx)?;
-        out.insert(name, sql_to_json(value));
+fn table_primary_key_columns(conn: &Connection, table: &str) -> Result<Vec<String>, ApiError> {
+    let columns = table_columns(conn, table)?;
+    let mut pk: Vec<String> = Vec::new();
+    for col in &columns {
+        if col.get("primary_key").and_then(Value::as_bool) == Some(true) {
+            if let Some(name) = col.get("name").and_then(Value::as_str) {
+                pk.push(name.to_string());
+            }
+        }
     }
-    Ok(out)
-}
-
-fn normalize_row_payload(data: Value) -> Result<Map<String, Value>, ApiError> {
-    let Some(obj) = data.as_object() else {
-        return Err(ApiError::new(400, "row body must be an object"));
-    };
-    if obj.is_empty() {
-        return Err(ApiError::new(400, "row body must be a non-empty object"));
-    }
-    let mut out = Map::new();
-    for (key, value) in obj {
-        let column = assert_user_ident(key)?;
-        let normalized = match value {
-            Value::Bool(value) => json!(i64::from(*value)),
-            Value::Number(_) | Value::String(_) | Value::Null => value.clone(),
-            Value::Array(_) | Value::Object(_) => Value::String(value.to_string()),
-        };
-        out.insert(column.to_string(), normalized);
-    }
-    Ok(out)
-}
-
-fn json_to_sql_value(value: &Value) -> SqlValue {
-    match value {
-        Value::Null => SqlValue::Null,
-        Value::Bool(value) => SqlValue::Integer(i64::from(*value)),
-        Value::Number(number) => number
-            .as_i64()
-            .map(SqlValue::Integer)
-            .or_else(|| number.as_f64().map(SqlValue::Real))
-            .unwrap_or(SqlValue::Null),
-        Value::String(value) => SqlValue::Text(value.clone()),
-        Value::Array(_) | Value::Object(_) => SqlValue::Text(value.to_string()),
-    }
-}
-
-fn sql_to_json(value: SqlValue) -> Value {
-    match value {
-        SqlValue::Null => Value::Null,
-        SqlValue::Integer(value) => json!(value),
-        SqlValue::Real(value) => json!(value),
-        SqlValue::Text(value) => Value::String(value),
-        SqlValue::Blob(value) => Value::String(STANDARD.encode(value)),
-    }
+    Ok(pk)
 }
 
 fn require_table(conn: &Connection, table: &str) -> Result<(), ApiError> {
@@ -3488,6 +3806,42 @@ fn require_bucket(conn: &Connection, bucket: &str) -> Result<(), ApiError> {
         )
         .optional()?;
     found.ok_or_else(|| ApiError::new(404, format!("bucket not found: {bucket}")))
+}
+
+fn require_storage_actor(actor: &Actor) -> Result<(), ApiError> {
+    if actor.is_anon() || actor.sub.is_none() {
+        return Err(ApiError::new(
+            403,
+            "storage access requires authenticated or service_role",
+        ));
+    }
+    Ok(())
+}
+
+fn authorize_storage_object(meta: &Map<String, Value>, actor: &Actor) -> Result<(), ApiError> {
+    require_storage_actor(actor)?;
+    if actor.is_admin() {
+        return Ok(());
+    }
+    let owner_id = meta.get("owner_id").and_then(Value::as_str).unwrap_or("");
+    match actor.sub.as_deref() {
+        Some(sub) if !owner_id.is_empty() && sub == owner_id => Ok(()),
+        _ => Err(ApiError::new(
+            403,
+            "access denied: object not owned by actor",
+        )),
+    }
+}
+
+fn storage_object_visible(meta: &Map<String, Value>, actor: &Actor) -> bool {
+    if actor.is_admin() {
+        return true;
+    }
+    let owner_id = meta.get("owner_id").and_then(Value::as_str).unwrap_or("");
+    actor
+        .sub
+        .as_deref()
+        .is_some_and(|sub| !owner_id.is_empty() && sub == owner_id)
 }
 
 fn open_project_connection(
@@ -3520,87 +3874,11 @@ fn open_project_connection(
     Ok(conn)
 }
 
-pub fn safe_project_id(project_id: &str) -> Result<&str, ApiError> {
-    let mut chars = project_id.chars();
-    let Some(first) = chars.next() else {
-        return Err(ApiError::new(
-            400,
-            "project id must match [A-Za-z0-9][A-Za-z0-9_-]{0,63}",
-        ));
-    };
-    if !first.is_ascii_alphanumeric()
-        || project_id.len() > 64
-        || !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
-    {
-        return Err(ApiError::new(
-            400,
-            "project id must match [A-Za-z0-9][A-Za-z0-9_-]{0,63}",
-        ));
-    }
-    Ok(project_id)
-}
-
-fn assert_user_ident(name: &str) -> Result<&str, ApiError> {
-    if !valid_ident(name) || name.starts_with("_sdb_") || name.starts_with("sqlite_") {
-        return Err(ApiError::new(
-            400,
-            format!("invalid user identifier: {name}"),
-        ));
-    }
-    Ok(name)
-}
-
-fn safe_object_key(key: &str) -> Result<&str, ApiError> {
-    if key.is_empty() || key.starts_with('/') || key.contains('\0') {
-        return Err(ApiError::new(400, "invalid object key"));
-    }
-    if key.split('/').any(|part| part == "." || part == "..") {
-        return Err(ApiError::new(
-            400,
-            "object key may not contain . or .. path segments",
-        ));
-    }
-    Ok(key)
-}
-
 fn sql_type(name: &str) -> Result<&'static str, ApiError> {
     TYPE_MAP
         .iter()
         .find_map(|(key, value)| (*key == name.to_lowercase()).then_some(*value))
         .ok_or_else(|| ApiError::new(400, format!("unsupported column type: {name}")))
-}
-
-fn snapshot_key(project_id: &str) -> String {
-    format!("projects/{project_id}/database.sqlite")
-}
-
-fn snapshot_generation_key(project_id: &str, generation: u64) -> String {
-    format!("projects/{project_id}/snapshots/{generation:020}.sqlite")
-}
-
-fn manifest_key(project_id: &str) -> String {
-    format!("projects/{project_id}/manifest.json")
-}
-
-fn writer_lease_key(project_id: &str) -> String {
-    format!("projects/{project_id}/writer-lease.json")
-}
-
-fn writer_lease_claim_key(project_id: &str, fencing_token: u64) -> String {
-    format!("projects/{project_id}/writer-lease-claims/{fencing_token:020}.json")
-}
-
-fn bookmark_for_seq(seq: u64) -> String {
-    format!("sdb1-{seq:020}")
-}
-
-fn bookmark_to_seq(bookmark: &str) -> Result<u64, ApiError> {
-    let raw = bookmark.trim();
-    let seq = raw
-        .strip_prefix("sdb1-")
-        .ok_or_else(|| ApiError::new(400, format!("invalid bookmark: {bookmark}")))?;
-    seq.parse::<u64>()
-        .map_err(|_| ApiError::new(400, format!("invalid bookmark: {bookmark}")))
 }
 
 fn manifest_commit_seq(manifest: Option<&DurableManifest>) -> u64 {
@@ -3614,16 +3892,6 @@ fn manifest_bookmark(manifest: &DurableManifest) -> String {
         bookmark_for_seq(manifest.commit_seq)
     } else {
         manifest.bookmark.clone()
-    }
-}
-
-fn with_bookmark(mut value: Value, bookmark: &str) -> Value {
-    match &mut value {
-        Value::Object(map) => {
-            map.insert("bookmark".to_string(), Value::String(bookmark.to_string()));
-            value
-        }
-        _ => json!({ "value": value, "bookmark": bookmark }),
     }
 }
 
@@ -3655,76 +3923,6 @@ fn validate_idempotency(idempotency: &WriteIdempotency) -> Result<(), ApiError> 
     Ok(())
 }
 
-fn wal_prefix(project_id: &str) -> String {
-    format!("projects/{project_id}/wal")
-}
-
-fn wal_segment_key(project_id: &str, segment_id: u64) -> String {
-    format!("{}/{segment_id:020}.wal", wal_prefix(project_id))
-}
-
-fn wal_segment_id(key: &str) -> Option<u64> {
-    key.rsplit('/')
-        .next()
-        .and_then(|name| name.strip_suffix(".wal"))
-        .and_then(|id| id.parse::<u64>().ok())
-}
-
-fn storage_key(project_id: &str, bucket: &str, key: &str) -> String {
-    format!("projects/{project_id}/storage/{bucket}/{key}")
-}
-
-fn change_log_key(project_id: &str, ops_since_snapshot: u64, reason: &str) -> String {
-    let reason = reason
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
-        .collect::<String>();
-    format!(
-        "projects/{project_id}/change-log/{}-{ops_since_snapshot:020}-{reason}.json",
-        now_ms()
-    )
-}
-
-fn read_file_range(path: &Path, offset: u64) -> Result<Vec<u8>, ApiError> {
-    let mut file = fs::File::open(path).map_err(anyhow::Error::from)?;
-    file.seek(SeekFrom::Start(offset))
-        .map_err(anyhow::Error::from)?;
-    let mut out = Vec::new();
-    file.read_to_end(&mut out).map_err(anyhow::Error::from)?;
-    Ok(out)
-}
-
-fn hex_sha256(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    format!("{:x}", hasher.finalize())
-}
-
-fn sha256_file(path: &Path) -> Result<String, ApiError> {
-    let data = fs::read(path).map_err(anyhow::Error::from)?;
-    Ok(hex_sha256(&data))
-}
-
-fn utc_now() -> String {
-    format!("{}", now_ms())
-}
-
-fn now_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-}
-
-fn new_runtime_id() -> String {
-    static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
-    format!(
-        "runtime-{}-{}",
-        std::process::id(),
-        NEXT_RUNTIME_ID.fetch_add(1, Ordering::SeqCst)
-    )
-}
-
 fn build_forward_client(options: &RuntimeOptions) -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_millis(
@@ -3739,34 +3937,6 @@ fn build_forward_client(options: &RuntimeOptions) -> anyhow::Result<reqwest::Cli
         .user_agent("serverless-db-core/0.1")
         .build()
         .map_err(anyhow::Error::from)
-}
-
-fn maybe_crash_after_stage(stage: &str) {
-    if std::env::var("SDB_INTERNAL_CRASH_AFTER_STAGE")
-        .ok()
-        .as_deref()
-        != Some(stage)
-    {
-        return;
-    }
-    let code = std::env::var("SDB_INTERNAL_CRASH_EXIT_CODE")
-        .ok()
-        .and_then(|value| value.parse::<i32>().ok())
-        .unwrap_or(199);
-    eprintln!("runtime crash injection: exiting after stage {stage}");
-    std::process::exit(code);
-}
-
-fn default_text_type() -> String {
-    "text".to_string()
-}
-
-fn default_auto_increment() -> bool {
-    true
-}
-
-fn default_all_operation() -> String {
-    "all".to_string()
 }
 
 #[cfg(test)]
@@ -4166,7 +4336,9 @@ mod tests {
                 &actor("alice"),
             )
             .unwrap();
-        let object = runtime.get_object("demo", "files", "hello.txt", &actor("alice")).unwrap();
+        let object = runtime
+            .get_object("demo", "files", "hello.txt", &actor("alice"))
+            .unwrap();
         assert_eq!(object.data, b"hello");
     }
 
@@ -5068,7 +5240,12 @@ mod tests {
         let (dir, first, _second) = shared_runtime_pair(60_000);
         setup_notes(&first);
         first
-            .insert_row("demo", "notes", json!({"owner_id":"alice","title":"first"}), &actor("alice"))
+            .insert_row(
+                "demo",
+                "notes",
+                json!({"owner_id":"alice","title":"first"}),
+                &actor("alice"),
+            )
             .unwrap();
 
         let lease_before = first.load_writer_lease("demo").unwrap().unwrap();
@@ -5087,7 +5264,12 @@ mod tests {
         let (_dir, first, _second) = shared_runtime_pair(60_000);
         setup_notes(&first);
         first
-            .insert_row("demo", "notes", json!({"owner_id":"alice","title":"first"}), &actor("alice"))
+            .insert_row(
+                "demo",
+                "notes",
+                json!({"owner_id":"alice","title":"first"}),
+                &actor("alice"),
+            )
             .unwrap();
 
         let claim_key = writer_lease_claim_key("demo", 999);
@@ -5101,11 +5283,17 @@ mod tests {
         };
         first
             .object_store
-            .put_bytes(&claim_key, serde_json::to_vec_pretty(&stale_lease).unwrap().as_slice())
+            .put_bytes(
+                &claim_key,
+                serde_json::to_vec_pretty(&stale_lease).unwrap().as_slice(),
+            )
             .unwrap();
 
         let removed = first.gc_lease_claims("demo").unwrap();
-        assert!(removed >= 1, "expected at least 1 claim removed, got {removed}");
+        assert!(
+            removed >= 1,
+            "expected at least 1 claim removed, got {removed}"
+        );
         assert!(!first.object_store.exists(&claim_key).unwrap());
     }
 
@@ -5129,6 +5317,83 @@ mod tests {
             .iter()
             .filter(|f| f.key.contains("lease-audit-"))
             .collect();
-        assert_eq!(audit_files.len(), 1, "expected 1 audit record, got {}", audit_files.len());
+        assert_eq!(
+            audit_files.len(),
+            1,
+            "expected 1 audit record, got {}",
+            audit_files.len()
+        );
+    }
+
+    #[test]
+    fn auth_store_survives_runtime_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_dir = dir.path().join("runtime");
+        let options = RuntimeOptions {
+            snapshot_every_ops: 1000,
+            snapshot_every_ms: 300_000,
+            metadata_every_ops: 100,
+            group_commit_max_ops: 64,
+            group_commit_delay_ms: 2,
+            writer_queue_capacity: 1024,
+            max_durable_wal_bytes: 64 * 1024 * 1024,
+            writer_lease_ttl_ms: 30_000,
+            read_replica: false,
+            replica_refresh_interval_ms: 1_000,
+            replica_bookmark_wait_timeout_ms: 5_000,
+            primary_url: None,
+            routing_region: None,
+            routing_endpoints: Vec::new(),
+            forward_connect_timeout_ms: 1_000,
+            forward_request_timeout_ms: 5_000,
+            forward_max_attempts: 3,
+            forward_retry_backoff_ms: 25,
+            routing_endpoint_failure_threshold: 2,
+            routing_endpoint_cooldown_ms: 1_000,
+            sqlite_synchronous: "NORMAL".to_string(),
+            supabase_project_id: "demo".to_string(),
+        };
+        let runtime = ProjectRuntime::new(&runtime_dir, options.clone()).unwrap();
+        runtime.create_project("demo").unwrap();
+        runtime
+            .auth_create_user(
+                "demo",
+                json!({
+                    "id": "auth-user-1",
+                    "email": "auth@example.com",
+                    "phone": null,
+                    "password_hash": "pw",
+                    "user_metadata": {},
+                    "app_metadata": {},
+                    "aud": "authenticated",
+                    "role": "authenticated",
+                    "created_at": "2026-06-21T00:00:00Z",
+                    "email_confirmed_at": "2026-06-21T00:00:00Z",
+                    "last_sign_in_at": "2026-06-21T00:00:00Z",
+                    "updated_at": "2026-06-21T00:00:00Z"
+                }),
+            )
+            .unwrap();
+        runtime
+            .auth_issue_refresh_token("demo", "refresh-1", "auth-user-1", "session-1", 1, 100)
+            .unwrap();
+        runtime.hibernate("demo").unwrap();
+
+        let restarted = ProjectRuntime::new(&runtime_dir, options).unwrap();
+        let user = restarted
+            .auth_get_user_by_email_or_phone("demo", "auth@example.com")
+            .unwrap()
+            .unwrap();
+        assert_eq!(user["id"], "auth-user-1");
+
+        let rotated = restarted
+            .auth_rotate_refresh_token("demo", "refresh-1", "refresh-2", 2, 101)
+            .unwrap();
+        assert_eq!(rotated["user"]["email"], "auth@example.com");
+        assert_eq!(rotated["session_id"], "session-1");
+        let err = restarted
+            .auth_rotate_refresh_token("demo", "refresh-1", "refresh-3", 3, 102)
+            .unwrap_err();
+        assert_eq!(err.status, 401);
     }
 }

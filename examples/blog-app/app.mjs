@@ -19,11 +19,12 @@
  *  14. Bookmark-based consistent reads
  *  15. Write idempotency (Idempotency-Key header)
  *  16. Supabase SDK compatibility (/rest/v1/{table})
- *  17. Supabase Storage API (/storage/v1) — bucket CRUD, object upload/download/list/delete
+ *  17. Supabase Storage API (/storage/v1) — admin buckets, private object owner enforcement
  *  18. Supabase Realtime SSE (/realtime/v1/stream) — authenticated SSE with table filter
  *  19. GoTrue-compatible Auth (/auth/v1) — signUp, signInWithPassword, getUser, refreshSession, signOut, settings
  *  20. Async object store — HTTP read paths use spawn_blocking for non-blocking IO
  *  21. Writer lease renewer — background lease renewal, claim GC, conflict audit
+ *  22. GoTrue logout revoke — signOut invalidates refresh tokens
  */
 
 import { createClient } from "@supabase/supabase-js";
@@ -41,7 +42,7 @@ const REPLICA_URLS = (process.env.SDB_REPLICA_URLS || "")
   .map((s) => s.trim())
   .filter(Boolean);
 const JWT_SECRET = process.env.SDB_JWT_SECRET || "dev-secret-change-me";
-const PROJECT_ID = process.env.SDB_PROJECT_ID || "blog-app";
+const PROJECT_ID = process.env.SDB_PROJECT_ID || "demo";
 const REPORT_DIR = process.env.SDB_REPORT_DIR || "reports";
 const IS_REMOTE = process.env.SDB_ENV === "production" || process.env.SDB_REMOTE === "1";
 
@@ -91,6 +92,12 @@ async function assertOk(label, method, urlPath, body, token, contentType, extraH
   return r;
 }
 
+function responseArray(data) {
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(data?.value)) return data.value;
+  return [];
+}
+
 // ---------------------------------------------------------------------------
 // JWT minting (local, for production mode where /v1/tokens is disabled)
 // ---------------------------------------------------------------------------
@@ -135,6 +142,9 @@ async function main() {
   console.log("› Tokens & Auth");
   const serviceToken = await mintToken("admin", "service_role");
   record("mint service_role token", "POST /v1/tokens", "PASS");
+
+  const anonToken = mintTokenLocal("anon", "anon", {});
+  record("mint anon token", "local HS256", "PASS");
 
   const aliceToken = await mintToken("alice", "authenticated", { orgs: ["acme", "beta"] });
   record("mint authenticated token (alice)", "POST /v1/tokens", "PASS", "claims: orgs=[acme,beta]");
@@ -315,9 +325,10 @@ async function main() {
   const bobPosts = await assertOk("bob select own posts", "GET", `/v1/projects/${PROJECT_ID}/tables/posts?eq.owner_id=bob&limit=10`, undefined, bobToken);
   record("policy enforcement: bob sees only own posts", "GET /tables/posts?eq.owner_id=bob", bobPosts.data.rows.length === 1 ? "PASS" : "FAIL", `rows=${bobPosts.data.rows.length}`);
 
-  // Bob cannot see alice's posts
+  // Bob can see Alice's published post through the published-read policy, but not Alice's draft.
   const bobSeeAlice = await assertOk("bob try select alice's posts", "GET", `/v1/projects/${PROJECT_ID}/tables/posts?eq.owner_id=alice&limit=10`, undefined, bobToken);
-  record("policy enforcement: bob cannot see alice's posts", "GET /tables/posts?eq.owner_id=alice", bobSeeAlice.data.rows.length === 0 ? "PASS" : "FAIL", `rows=${bobSeeAlice.data.rows.length}`);
+  const bobSeesOnlyPublishedAlice = bobSeeAlice.data.rows.length === 1 && !bobSeeAlice.data.rows.some((row) => row.title === "Draft Post");
+  record("policy enforcement: bob cannot see alice draft", "GET /tables/posts?eq.owner_id=alice", bobSeesOnlyPublishedAlice ? "PASS" : "FAIL", `rows=${bobSeeAlice.data.rows.length}`);
 
   // Public read on tags (no token needed)
   const tagsNoAuth = await assertOk("anon select tags (public read)", "GET", `/v1/projects/${PROJECT_ID}/tables/tags?limit=10`);
@@ -439,9 +450,15 @@ async function main() {
   await assertOk("supabase create bucket", "POST", `/storage/v1/buckets`, { name: "avatars" }, serviceToken, "application/json", { "idempotency-key": "supa-bucket-avatars" });
   record("supabase storage: create bucket", "POST /storage/v1/buckets", "PASS", "name=avatars");
 
+  const anonBucketList = await req("GET", `/storage/v1/buckets`, undefined, anonToken);
+  record("supabase storage: anon cannot list buckets", "GET /storage/v1/buckets", anonBucketList.status === 403 ? "PASS" : "FAIL", `status=${anonBucketList.status}`);
+
   const sbBuckets = await assertOk("supabase list buckets", "GET", `/storage/v1/buckets`, undefined, serviceToken);
-  const sbBucketNames = sbBuckets.data.value.map((b) => b.name);
+  const sbBucketNames = responseArray(sbBuckets.data).map((b) => b.name);
   record("supabase storage: list buckets", "GET /storage/v1/buckets", sbBucketNames.includes("avatars") ? "PASS" : "FAIL", `buckets=${sbBucketNames.join(",")}`);
+
+  const anonUpload = await req("POST", `/storage/v1/object/avatars/anon.png`, "NOPE", anonToken, "image/png");
+  record("supabase storage: anon cannot upload object", "POST /storage/v1/object/avatars/anon.png", anonUpload.status === 403 ? "PASS" : "FAIL", `status=${anonUpload.status}`);
 
   await assertOk("supabase upload object", "POST", `/storage/v1/object/avatars/alice.png`, "PNGDATA", aliceToken, "image/png");
   record("supabase storage: upload object", "POST /storage/v1/object/avatars/alice.png", "PASS", "6 bytes");
@@ -450,9 +467,20 @@ async function main() {
   const sbGotData = Buffer.from(sbGetObj.data).toString("utf8");
   record("supabase storage: download object", "GET /storage/v1/object/avatars/alice.png", sbGotData === "PNGDATA" ? "PASS" : "FAIL", `${sbGotData.length} chars`);
 
-  const sbListRes = await assertOk("supabase list objects", "POST", `/storage/v1/object/list/avatars`, { limit: 10, offset: 0 }, serviceToken, "application/json");
-  const sbObjKeys = sbListRes.data.value.map((o) => o.key);
-  record("supabase storage: list objects", "POST /storage/v1/object/list/avatars", sbObjKeys.includes("alice.png") ? "PASS" : "FAIL", `keys=${sbObjKeys.join(",")}`);
+  const bobGetAlice = await req("GET", `/storage/v1/object/avatars/alice.png`, undefined, bobToken);
+  record("supabase storage: bob cannot download alice object", "GET /storage/v1/object/avatars/alice.png", bobGetAlice.status === 403 ? "PASS" : "FAIL", `status=${bobGetAlice.status}`);
+
+  const sbAliceListRes = await assertOk("supabase list own objects", "POST", `/storage/v1/object/list/avatars`, { limit: 10, offset: 0 }, aliceToken, "application/json");
+  const sbAliceObjKeys = responseArray(sbAliceListRes.data).map((o) => o.key);
+  record("supabase storage: authenticated list own objects", "POST /storage/v1/object/list/avatars", sbAliceObjKeys.includes("alice.png") ? "PASS" : "FAIL", `keys=${sbAliceObjKeys.join(",")}`);
+
+  const sbBobListRes = await assertOk("supabase list other objects filtered", "POST", `/storage/v1/object/list/avatars`, { limit: 10, offset: 0 }, bobToken, "application/json");
+  const sbBobObjKeys = responseArray(sbBobListRes.data).map((o) => o.key);
+  record("supabase storage: bob list hides alice object", "POST /storage/v1/object/list/avatars", !sbBobObjKeys.includes("alice.png") ? "PASS" : "FAIL", `keys=${sbBobObjKeys.join(",")}`);
+
+  const sbServiceListRes = await assertOk("supabase service lists all objects", "POST", `/storage/v1/object/list/avatars`, { limit: 10, offset: 0 }, serviceToken, "application/json");
+  const sbServiceObjKeys = responseArray(sbServiceListRes.data).map((o) => o.key);
+  record("supabase storage: service_role list objects", "POST /storage/v1/object/list/avatars", sbServiceObjKeys.includes("alice.png") ? "PASS" : "FAIL", `keys=${sbServiceObjKeys.join(",")}`);
 
   await assertOk("supabase delete object", "DELETE", `/storage/v1/object/avatars/alice.png`, undefined, aliceToken);
   record("supabase storage: delete object", "DELETE /storage/v1/object/avatars/alice.png", "PASS");
@@ -534,7 +562,6 @@ async function main() {
 
   // --- GoTrue-compatible Auth ---
   console.log("\n› GoTrue Auth (/auth/v1/*)");
-  const anonToken = mintTokenLocal("anon", "anon", {});
   const authClient = createClient(BASE_URL, anonToken, {
     auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
   });
@@ -567,11 +594,13 @@ async function main() {
   }
 
   // refreshSession
+  let refreshTokenToRevoke = signInRes.data.session?.refresh_token;
   if (signInRes.data.session?.refresh_token) {
     const refreshRes = await authClient.auth.refreshSession({ refresh_token: signInRes.data.session.refresh_token });
     if (refreshRes.error) {
       record("auth.refreshSession()", "POST /auth/v1/token?grant_type=refresh_token", "FAIL", refreshRes.error.message);
     } else {
+      refreshTokenToRevoke = refreshRes.data.session?.refresh_token || refreshTokenToRevoke;
       record("auth.refreshSession()", "POST /auth/v1/token?grant_type=refresh_token", "PASS", `new_session=${refreshRes.data.session ? "yes" : "no"}`);
     }
   }
@@ -579,6 +608,10 @@ async function main() {
   // signOut
   const signOutRes = await authClient.auth.signOut();
   record("auth.signOut()", "POST /auth/v1/logout", signOutRes.error ? "FAIL" : "PASS", signOutRes.error?.message || "");
+  if (refreshTokenToRevoke) {
+    const refreshAfterLogout = await req("POST", "/auth/v1/token?grant_type=refresh_token", { refresh_token: refreshTokenToRevoke }, anonToken);
+    record("auth.signOut() revokes refresh token", "POST /auth/v1/token?grant_type=refresh_token", refreshAfterLogout.status === 401 ? "PASS" : "FAIL", `status=${refreshAfterLogout.status}`);
+  }
 
   // auth settings
   const settingsRes = await req("GET", "/auth/v1/settings", undefined, anonToken);
@@ -708,10 +741,11 @@ async function main() {
     "15. **Read replica** — async catch-up, write forwarding (when SDB_REPLICA_URLS set)",
     "16. **Hibernate recovery** — data survives hibernate + rehydrate from object store",
     "17. **Crash recovery** — data survives crash, recovered from snapshot + durable WAL",
-    "18. **Supabase Storage API** — bucket CRUD, object upload/download/list/delete via /storage/v1",
+    "18. **Supabase Storage API** — service_role bucket admin, private owner-only object upload/download/list/delete via /storage/v1",
     "19. **Supabase Realtime SSE** — authenticated SSE stream via /realtime/v1/stream with table filter",
     "20. **Async object store** — HTTP read paths use AsyncObjectStore + spawn_blocking for non-blocking IO",
     "21. **Writer lease renewer** — background lease renewal, expired claim GC, lease conflict audit logging",
+    "22. **GoTrue logout revoke** — signOut revokes refresh tokens by session scope",
     "",
   ];
   const reportPath = path.join(REPORT_DIR, "blog-app-verification-report.md");

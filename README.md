@@ -154,7 +154,7 @@ eval "$(./scripts/bootstrap-distributed-poc.sh http://127.0.0.1:8765)"
 npm run supabase:compat
 ```
 
-`/rest/v1/{table}` 当前支持 supabase-js 的 table CRUD：`select('*').eq(...).limit(...)`、`insert(object).select()`、`update(...).eq(...).select()`、`delete().eq(...).select()`。该入口复用 Rust core 的 JWT、policy、writer idempotency、replica forwarding 和 bookmark read path；Auth/Storage/Realtime 的 Supabase 协议兼容仍未实现。
+`/rest/v1/{table}` 当前支持 supabase-js 的 table CRUD：`select('*').eq(...).limit(...)`、`insert(object).select()`、`update(...).eq(...).select()`、`delete().eq(...).select()`。该入口复用 Rust core 的 JWT、policy、writer idempotency、replica forwarding 和 bookmark read path；`/auth/v1` 已支持 email/password、refresh rotation、logout scope revoke 和 user settings/update，`/storage/v1` 已支持 private-by-default bucket/object CRUD，`/realtime/v1/stream` 已支持 authenticated SSE 原型。
 
 远端分布式 Docker 集群：
 
@@ -190,7 +190,7 @@ docker compose -f deploy/docker-compose.distributed.yml up -d --build
 docker compose -f deploy/docker-compose.distributed.yml run --rm blog-example
 ```
 
-该示例模拟一个多租户博客平台，验证 health、JWT auth、多表 schema、Policy DSL 全部 7 种 rule、CRUD + 策略隔离、Storage 对象上传/下载/删除、Realtime outbox + SSE、Bookmark 一致性读、写幂等、Supabase SDK 兼容、Read replica 异步追赶 + 写转发、Hibernate/Crash 恢复。报告输出到 `reports/blog-app-verification-report.md`。
+该示例模拟一个多租户博客平台，验证 health、JWT auth、多表 schema、Policy DSL 全部 7 种 rule、CRUD + 策略隔离、Storage 私有默认与对象 owner 隔离、Realtime outbox + SSE、Bookmark 一致性读、写幂等、Supabase SDK 兼容、GoTrue logout revoke、Read replica 异步追赶 + 写转发、Hibernate/Crash 恢复。报告输出到 `reports/blog-app-verification-report.md`。
 
 ## 测试
 
@@ -213,7 +213,7 @@ npm run dev
 
 ### Supabase JS SDK 兼容性测试
 
-使用真实 `@supabase/supabase-js` SDK 验证 PostgREST CRUD/筛选/变换、GoTrue Auth（注册/登录/登出/刷新/用户更新）、RLS 策略隔离、Storage 上传/下载/列表/删除：
+使用真实 `@supabase/supabase-js` SDK 验证 PostgREST CRUD/筛选/变换、GoTrue Auth（注册/登录/登出 revoke/刷新/用户更新）、RLS 策略隔离、Storage private-by-default 上传/下载/列表/删除：
 
 ```bash
 # 终端 1：启动 Rust 服务
@@ -223,7 +223,7 @@ npm run core:dev
 npm run test:sdk
 ```
 
-49 项测试覆盖：PostgREST 基本 CRUD（select/insert/update/delete/upsert/single）、筛选器（eq/neq/gt/gte/lt/lte/in/like/ilike/is/not/链式 AND）、变换（order/limit/range/maybeSingle）、RLS 策略隔离（anon/authenticated 读写权限、用户只能操作自己的行）、GoTrue Auth（signUp/signInWithPassword/signOut/getUser/refreshSession/updateUser/重复注册拒绝/错误密码拒绝/不存在用户拒绝/user_metadata/auth settings）、Storage（bucket 创建/列表/删除、文件上传/下载/列表/删除）、Auth+PostgREST 集成。
+测试覆盖：PostgREST 基本 CRUD（select/insert/update/delete/upsert/single）、筛选器（eq/neq/gt/gte/lt/lte/in/like/ilike/is/not/链式 AND）、变换（order/limit/range/maybeSingle）、RLS 策略隔离（anon/authenticated 读写权限、用户只能操作自己的行）、GoTrue Auth（signUp/signInWithPassword/signOut/global 和 local scope revoke/getUser/refreshSession/updateUser/重复注册拒绝/错误密码拒绝/不存在用户拒绝/user_metadata/auth settings）、Storage（bucket 管理需 service_role、匿名 object 访问拒绝、authenticated 用户只能访问 own object、service_role 管理路径保留）、Auth+PostgREST 集成。
 
 ## 性能验证
 
@@ -368,8 +368,11 @@ curl -s "http://127.0.0.1:8765/v1/projects/demo/tables/notes?bookmark=$BOOKMARK"
 
 ### Storage
 
+Bucket create/list/get/delete 属于管理面操作，需要 `service_role`/admin token。Object upload/list/download/delete 默认私有，需要 authenticated 或 service_role；普通 authenticated 用户只能访问自己上传、`owner_id == actor.sub` 的 object。
+
 ```bash
 curl -s -X POST http://127.0.0.1:8765/v1/projects/demo/buckets \
+  -H "authorization: Bearer $SERVICE_TOKEN" \
   -H 'content-type: application/json' \
   -d '{"name":"files"}'
 
@@ -387,30 +390,30 @@ curl -s http://127.0.0.1:8765/v1/projects/demo/storage/files/hello.txt \
 ```bash
 # Create bucket
 curl -s -X POST http://127.0.0.1:8765/storage/v1/buckets \
-  -H "apikey: $TOKEN" \
+  -H "apikey: $SERVICE_TOKEN" \
   -H 'content-type: application/json' \
   -d '{"name":"files"}'
 
 # List buckets
-curl -s http://127.0.0.1:8765/storage/v1/buckets -H "apikey: $TOKEN"
+curl -s http://127.0.0.1:8765/storage/v1/buckets -H "apikey: $SERVICE_TOKEN"
 
 # Upload object
 curl -s -X POST http://127.0.0.1:8765/storage/v1/object/files/hello.txt \
-  -H "apikey: $TOKEN" \
+  -H "apikey: $ACCESS_TOKEN" \
   -H 'content-type: text/plain' \
   --data-binary 'hello world'
 
 # Download object
-curl -s http://127.0.0.1:8765/storage/v1/object/files/hello.txt -H "apikey: $TOKEN"
+curl -s http://127.0.0.1:8765/storage/v1/object/files/hello.txt -H "apikey: $ACCESS_TOKEN"
 
 # List objects
 curl -s -X POST http://127.0.0.1:8765/storage/v1/object/list/files \
-  -H "apikey: $TOKEN" \
+  -H "apikey: $ACCESS_TOKEN" \
   -H 'content-type: application/json' \
   -d '{"limit":10,"offset":0}'
 
 # Delete object
-curl -s -X DELETE http://127.0.0.1:8765/storage/v1/object/files/hello.txt -H "apikey: $TOKEN"
+curl -s -X DELETE http://127.0.0.1:8765/storage/v1/object/files/hello.txt -H "apikey: $ACCESS_TOKEN"
 ```
 
 #### GoTrue-compatible Auth API (`/auth/v1`)
@@ -446,8 +449,8 @@ curl -s -X POST http://127.0.0.1:8765/auth/v1/token?grant_type=refresh_token \
   -H 'content-type: application/json' \
   -d '{"refresh_token":"$REFRESH_TOKEN"}'
 
-# Sign out (revoke current session)
-curl -s -X POST http://127.0.0.1:8765/auth/v1/logout \
+# Sign out. Default scope is global; supported scopes: global, local, others.
+curl -s -X POST 'http://127.0.0.1:8765/auth/v1/logout?scope=local' \
   -H "apikey: $ANON_KEY" \
   -H "authorization: Bearer $ACCESS_TOKEN"
 

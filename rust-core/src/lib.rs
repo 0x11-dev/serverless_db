@@ -1,6 +1,10 @@
 pub mod auth;
+pub mod auth_store;
+pub mod control_plane;
 pub mod http;
 pub mod object_store;
 pub mod policy;
 pub mod postgrest;
+pub mod realtime_protocol;
 pub mod runtime;
+pub mod runtime_utils;
