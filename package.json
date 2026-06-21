@@ -1,0 +1,34 @@
+{
+  "name": "serverless-db-poc",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/server.ts --host 127.0.0.1 --port 8765 --runtime-dir .runtime",
+    "start": "node dist/server.js --host 127.0.0.1 --port 8765 --runtime-dir .runtime",
+    "build": "tsc -p tsconfig.json",
+    "test": "tsx tests/poc.test.ts",
+    "demo": "tsx examples/demo.ts http://127.0.0.1:8765",
+    "bench": "tsx bench/perf.ts",
+    "core:dev": "cargo run --manifest-path rust-core/Cargo.toml --bin serverless-db-core -- --host 127.0.0.1 --port 8765 --runtime-dir .runtime-rust",
+    "core:test": "cargo test --manifest-path rust-core/Cargo.toml",
+    "core:bench": "cargo run --release --manifest-path rust-core/Cargo.toml --bin bench --",
+    "core:store-conformance": "cargo run --release --manifest-path rust-core/Cargo.toml --bin object_store_conformance --",
+    "core:s3-conformance": "bash scripts/s3-conformance.sh",
+    "core:s3-fault-injection": "bash scripts/s3-fault-injection.sh",
+    "core:s3-http-fault-injection": "bash scripts/s3-http-fault-injection.sh",
+    "core:s3-retry-idempotency": "bash scripts/s3-retry-idempotency.sh",
+    "core:crash-matrix": "cargo run --release --manifest-path rust-core/Cargo.toml --bin crash_matrix --",
+    "supabase:compat": "node scripts/supabase-compat-check.mjs"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.108.2",
+    "better-sqlite3": "^11.10.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.15.30",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  }
+}

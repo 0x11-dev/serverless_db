@@ -1,0 +1,208 @@
+services:
+  rustfs:
+    image: rustfs/rustfs:latest
+    command: /data
+    environment:
+      RUSTFS_ACCESS_KEY: ${S3_ROOT_USER:?set S3_ROOT_USER in .env}
+      RUSTFS_SECRET_KEY: ${S3_ROOT_PASSWORD:?set S3_ROOT_PASSWORD in .env}
+    volumes:
+      - rustfs-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/health/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  create-bucket:
+    image: amazon/aws-cli
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: ${S3_ROOT_USER:?set S3_ROOT_USER in .env}
+      AWS_SECRET_ACCESS_KEY: ${S3_ROOT_PASSWORD:?set S3_ROOT_PASSWORD in .env}
+      AWS_EC2_METADATA_DISABLED: "true"
+      SDB_S3_BUCKET: ${SDB_S3_BUCKET:-serverless-db-poc}
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        aws --endpoint-url http://rustfs:9000 s3 mb "s3://$${SDB_S3_BUCKET}" 2>/dev/null || true
+
+  primary:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    depends_on:
+      create-bucket:
+        condition: service_completed_successfully
+    environment:
+      AWS_ACCESS_KEY_ID: ${S3_ROOT_USER:?set S3_ROOT_USER in .env}
+      AWS_SECRET_ACCESS_KEY: ${S3_ROOT_PASSWORD:?set S3_ROOT_PASSWORD in .env}
+      AWS_EC2_METADATA_DISABLED: "true"
+      AWS_REGION: us-east-1
+      SDB_ENV: ${SDB_ENV:-production}
+      SDB_JWT_SECRET: ${SDB_JWT_SECRET:?set SDB_JWT_SECRET in .env}
+      SDB_CORS_ORIGINS: ${SDB_CORS_ORIGINS:-}
+      SDB_S3_ADAPTER_MAX_ATTEMPTS: "4"
+    command:
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8765"
+      - --runtime-dir
+      - /var/lib/serverless-db/primary
+      - --object-store
+      - s3
+      - --s3-bucket
+      - ${SDB_S3_BUCKET:-serverless-db-poc}
+      - --s3-prefix
+      - ${SDB_S3_PREFIX:-distributed-poc}
+      - --s3-endpoint
+      - http://rustfs:9000
+      - --s3-region
+      - us-east-1
+      - --s3-force-path-style
+      - --supabase-project-id
+      - ${SDB_PROJECT_ID:-demo}
+      - --routing-region
+      - primary
+      - --routing-endpoint
+      - replica,replica-a,http://replica-a:8765
+      - --routing-endpoint
+      - replica,replica-b,http://replica-b:8765
+      - --group-commit-max-ops
+      - "64"
+      - --group-commit-delay-ms
+      - "2"
+      - --writer-queue-capacity
+      - "4096"
+      - --max-durable-wal-bytes
+      - "67108864"
+      - --writer-lease-ttl-ms
+      - "30000"
+    volumes:
+      - primary-cache:/var/lib/serverless-db/primary
+    ports:
+      - "80:8765"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8765/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  replica-a:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    depends_on:
+      primary:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: ${S3_ROOT_USER:?set S3_ROOT_USER in .env}
+      AWS_SECRET_ACCESS_KEY: ${S3_ROOT_PASSWORD:?set S3_ROOT_PASSWORD in .env}
+      AWS_EC2_METADATA_DISABLED: "true"
+      AWS_REGION: us-east-1
+      SDB_ENV: ${SDB_ENV:-production}
+      SDB_JWT_SECRET: ${SDB_JWT_SECRET:?set SDB_JWT_SECRET in .env}
+      SDB_CORS_ORIGINS: ${SDB_CORS_ORIGINS:-}
+      SDB_S3_ADAPTER_MAX_ATTEMPTS: "4"
+    command: &replica-command
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8765"
+      - --runtime-dir
+      - /var/lib/serverless-db/runtime
+      - --object-store
+      - s3
+      - --s3-bucket
+      - ${SDB_S3_BUCKET:-serverless-db-poc}
+      - --s3-prefix
+      - ${SDB_S3_PREFIX:-distributed-poc}
+      - --s3-endpoint
+      - http://rustfs:9000
+      - --s3-region
+      - us-east-1
+      - --s3-force-path-style
+      - --supabase-project-id
+      - ${SDB_PROJECT_ID:-demo}
+      - --read-replica
+      - --primary-url
+      - http://primary:8765
+      - --routing-region
+      - replica-a
+      - --routing-endpoint
+      - primary,primary,http://primary:8765
+      - --replica-refresh-interval-ms
+      - "500"
+      - --replica-bookmark-wait-timeout-ms
+      - "5000"
+    volumes:
+      - replica-a-cache:/var/lib/serverless-db/runtime
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8765/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  replica-b:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    depends_on:
+      primary:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: ${S3_ROOT_USER:?set S3_ROOT_USER in .env}
+      AWS_SECRET_ACCESS_KEY: ${S3_ROOT_PASSWORD:?set S3_ROOT_PASSWORD in .env}
+      AWS_EC2_METADATA_DISABLED: "true"
+      AWS_REGION: us-east-1
+      SDB_ENV: ${SDB_ENV:-production}
+      SDB_JWT_SECRET: ${SDB_JWT_SECRET:?set SDB_JWT_SECRET in .env}
+      SDB_CORS_ORIGINS: ${SDB_CORS_ORIGINS:-}
+      SDB_S3_ADAPTER_MAX_ATTEMPTS: "4"
+    command:
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8765"
+      - --runtime-dir
+      - /var/lib/serverless-db/runtime
+      - --object-store
+      - s3
+      - --s3-bucket
+      - ${SDB_S3_BUCKET:-serverless-db-poc}
+      - --s3-prefix
+      - ${SDB_S3_PREFIX:-distributed-poc}
+      - --s3-endpoint
+      - http://rustfs:9000
+      - --s3-region
+      - us-east-1
+      - --s3-force-path-style
+      - --supabase-project-id
+      - ${SDB_PROJECT_ID:-demo}
+      - --read-replica
+      - --primary-url
+      - http://primary:8765
+      - --routing-region
+      - replica-b
+      - --routing-endpoint
+      - primary,primary,http://primary:8765
+      - --replica-refresh-interval-ms
+      - "500"
+      - --replica-bookmark-wait-timeout-ms
+      - "5000"
+    volumes:
+      - replica-b-cache:/var/lib/serverless-db/runtime
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8765/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  rustfs-data:
+  primary-cache:
+  replica-a-cache:
+  replica-b-cache:
