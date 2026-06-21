@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { URL } from "node:url";
-import { AuthError, actorFromAuthorization, mintToken } from "./auth.js";
+import { AuthError, actorFromAuthorization, isAdmin, mintToken, type Actor } from "./auth.js";
 import { ApiError, ProjectRuntime } from "./runtime.js";
 
 type JsonObject = Record<string, unknown>;
@@ -41,6 +41,10 @@ async function dispatch(runtime: ProjectRuntime, req: IncomingMessage, res: Serv
   }
 
   if (method === "POST" && same(segments, ["v1", "tokens"])) {
+    if (process.env.SDB_ENV === "production") {
+      throw new ApiError(403, "token minting is disabled in production mode");
+    }
+    const admin = requireAdmin(req);
     const body = await readJson(req);
     const token = mintToken({
       sub: String(body.sub ?? ""),
@@ -48,11 +52,12 @@ async function dispatch(runtime: ProjectRuntime, req: IncomingMessage, res: Serv
       claims: isRecord(body.claims) ? body.claims : {},
       expiresIn: typeof body.expires_in === "number" ? body.expires_in : undefined
     });
-    sendJson(res, 200, { token });
+    sendJson(res, 200, { token, minted_by: admin.sub });
     return;
   }
 
   if (method === "POST" && same(segments, ["v1", "projects"])) {
+    requireAdmin(req);
     const body = await readJson(req);
     sendJson(res, 201, runtime.createProject(String(body.id ?? body.project_id ?? "")));
     return;
@@ -76,41 +81,50 @@ async function projectRoute(
   url: URL
 ): Promise<void> {
   if (method === "POST" && same(tail, ["hibernate"])) {
+    requireAdmin(req);
     sendJson(res, 200, runtime.hibernate(projectId));
     return;
   }
   if (method === "POST" && same(tail, ["crash"])) {
+    requireAdmin(req);
     sendJson(res, 200, runtime.crashProject(projectId));
     return;
   }
   if (method === "GET" && same(tail, ["schema"])) {
+    requireAdmin(req);
     sendJson(res, 200, runtime.schema(projectId));
     return;
   }
   if (method === "POST" && same(tail, ["tables"])) {
+    requireAdmin(req);
     sendJson(res, 201, runtime.createTable(projectId, (await readJson(req)) as never));
     return;
   }
   if (method === "PUT" && same(tail, ["policies"])) {
+    requireAdmin(req);
     sendJson(res, 200, runtime.setPolicy(projectId, (await readJson(req)) as never));
     return;
   }
   if (method === "GET" && same(tail, ["policies"])) {
+    requireAdmin(req);
     sendJson(res, 200, { policies: runtime.listPolicies(projectId) });
     return;
   }
   if (method === "POST" && same(tail, ["buckets"])) {
+    requireAdmin(req);
     const body = await readJson(req);
     sendJson(res, 201, runtime.createBucket(projectId, String(body.name ?? "")));
     return;
   }
   if (method === "GET" && same(tail, ["events"])) {
+    requireAdmin(req);
     sendJson(res, 200, {
       events: runtime.events(projectId, numberParam(url, "since", 0), numberParam(url, "limit", 100))
     });
     return;
   }
   if (method === "GET" && same(tail, ["realtime"])) {
+    requireAdmin(req);
     await sendSse(runtime, req, res, projectId, numberParam(url, "since", 0));
     return;
   }
@@ -260,6 +274,14 @@ function numberParam(url: URL, key: string, fallback: number): number {
   if (raw === null) return fallback;
   const value = Number(raw);
   return Number.isFinite(value) ? value : fallback;
+}
+
+function requireAdmin(req: IncomingMessage): Actor {
+  const actor = actorFromAuthorization(req.headers.authorization);
+  if (isAdmin(actor)) {
+    return actor;
+  }
+  throw new ApiError(403, "admin or service_role access required");
 }
 
 function same(a: string[], b: string[]): boolean {

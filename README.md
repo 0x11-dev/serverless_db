@@ -295,10 +295,34 @@ Cloudflare D1 的核心边界是 SQLite + 单库单主写入：单个 D1 databas
 
 ## API 摘要
 
-### Token
+### Token / Admin
+
+```bash
+export SDB_JWT_SECRET="${SDB_JWT_SECRET:-dev-secret-change-me}"
+
+mint_token() {
+  node -e '
+    const { createHmac } = require("node:crypto");
+    const [sub, role, claimsJson = "{}"] = process.argv.slice(1);
+    const secret = process.env.SDB_JWT_SECRET || "dev-secret-change-me";
+    const now = Math.floor(Date.now() / 1000);
+    const payload = { sub, role, claims: JSON.parse(claimsJson), iat: now };
+    const b64 = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
+    const signingInput = `${b64({ alg: "HS256", typ: "JWT" })}.${b64(payload)}`;
+    const sig = createHmac("sha256", secret).update(signingInput).digest("base64url");
+    process.stdout.write(`${signingInput}.${sig}`);
+  ' "$1" "$2" "${3:-{}}"
+}
+
+SERVICE_TOKEN="$(mint_token admin service_role '{}')"
+TOKEN="$(mint_token alice authenticated '{"orgs":["demo"]}')"
+```
+
+管理面 API 需要 `service_role`/admin token。开发模式下 `/v1/tokens` 可用，但也需要 admin token；`SDB_ENV=production` 时会禁用开发 token minting：
 
 ```bash
 curl -s -X POST http://127.0.0.1:8765/v1/tokens \
+  -H "authorization: Bearer $SERVICE_TOKEN" \
   -H 'content-type: application/json' \
   -d '{"sub":"alice","claims":{"orgs":["demo"]}}'
 ```
@@ -307,14 +331,17 @@ curl -s -X POST http://127.0.0.1:8765/v1/tokens \
 
 ```bash
 curl -s -X POST http://127.0.0.1:8765/v1/projects \
+  -H "authorization: Bearer $SERVICE_TOKEN" \
   -H 'content-type: application/json' \
   -d '{"id":"demo"}'
 
 curl -s -X POST http://127.0.0.1:8765/v1/projects/demo/tables \
+  -H "authorization: Bearer $SERVICE_TOKEN" \
   -H 'content-type: application/json' \
   -d '{"name":"notes","columns":[{"name":"owner_id","type":"text","not_null":true},{"name":"title","type":"text","not_null":true}]}'
 
-curl -s http://127.0.0.1:8765/v1/projects/demo/schema
+curl -s http://127.0.0.1:8765/v1/projects/demo/schema \
+  -H "authorization: Bearer $SERVICE_TOKEN"
 ```
 
 ### Policy DSL
@@ -342,8 +369,6 @@ curl -s http://127.0.0.1:8765/v1/projects/demo/schema
 ### CRUD
 
 ```bash
-TOKEN="$(curl -s -X POST http://127.0.0.1:8765/v1/tokens -H 'content-type: application/json' -d '{"sub":"alice"}' | node -e 'let s=""; process.stdin.on("data",d=>s+=d); process.stdin.on("end",()=>console.log(JSON.parse(s).token))')"
-
 curl -s -X POST http://127.0.0.1:8765/v1/projects/demo/tables/notes \
   -H "authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' \
@@ -463,13 +488,15 @@ curl -s http://127.0.0.1:8765/auth/v1/settings -H "apikey: $ANON_KEY"
 Polling：
 
 ```bash
-curl -s http://127.0.0.1:8765/v1/projects/demo/events?since=0
+curl -s http://127.0.0.1:8765/v1/projects/demo/events?since=0 \
+  -H "authorization: Bearer $SERVICE_TOKEN"
 ```
 
 SSE：
 
 ```bash
-curl -N http://127.0.0.1:8765/v1/projects/demo/realtime?since=0
+curl -N http://127.0.0.1:8765/v1/projects/demo/realtime?since=0 \
+  -H "authorization: Bearer $SERVICE_TOKEN"
 ```
 
 #### Supabase Realtime SSE (`/realtime/v1/stream`)
@@ -485,14 +512,16 @@ curl -N "http://127.0.0.1:8765/realtime/v1/stream?since=0&table=posts" \
 `hibernate` 会 close connection 并删除 local cache。下一次请求会从对象存储 snapshot rehydrate：
 
 ```bash
-curl -s -X POST http://127.0.0.1:8765/v1/projects/demo/hibernate
+curl -s -X POST http://127.0.0.1:8765/v1/projects/demo/hibernate \
+  -H "authorization: Bearer $SERVICE_TOKEN"
 curl -s http://127.0.0.1:8765/v1/projects/demo/tables/notes -H "authorization: Bearer $TOKEN"
 ```
 
 未优雅退出验证：
 
 ```bash
-curl -s -X POST http://127.0.0.1:8765/v1/projects/demo/crash
+curl -s -X POST http://127.0.0.1:8765/v1/projects/demo/crash \
+  -H "authorization: Bearer $SERVICE_TOKEN"
 curl -s http://127.0.0.1:8765/v1/projects/demo/tables/notes -H "authorization: Bearer $TOKEN"
 ```
 

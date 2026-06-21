@@ -89,6 +89,10 @@ export function actorClaim(actor: Actor, name: string): unknown {
   return actor.claims[name];
 }
 
+export function isAdmin(actor: Actor): boolean {
+  return actor.role === "service_role" || actor.role === "admin";
+}
+
 function hmac(signingInput: string, secret?: string): string {
   return createHmac("sha256", secret ?? process.env.SDB_JWT_SECRET ?? DEFAULT_SECRET)
     .update(signingInput)
@@ -102,4 +106,3 @@ function base64url(value: string): string {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
-

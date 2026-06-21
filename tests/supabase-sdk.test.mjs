@@ -24,6 +24,7 @@ const BASE_URL = process.env.SDB_BASE_URL || "http://127.0.0.1:8765";
 const JWT_SECRET = process.env.SDB_JWT_SECRET || "dev-secret-change-me";
 const PROJECT_ID = process.env.SDB_PROJECT_ID || "demo";
 const ANON_KEY = mintJwtLocal("anon", "anon", {}, 315360000);
+const SERVICE_KEY = mintJwtLocal("admin", "service_role", {}, 315360000);
 let clientCounter = 0;
 
 // ---------------------------------------------------------------------------
@@ -47,7 +48,7 @@ async function mintToken(sub, role, claims = {}, expiresIn = 315360000) {
   try {
     const res = await fetch(`${BASE_URL}/v1/tokens`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { authorization: `Bearer ${SERVICE_KEY}`, "content-type": "application/json" },
       body: JSON.stringify({ sub, role, claims, expires_in: expiresIn }),
     });
     if (res.ok) {

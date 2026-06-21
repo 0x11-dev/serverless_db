@@ -265,5 +265,5 @@
 
 - `README.md` 已更新 Phase 0 安全语义；后续仍需要在控制面/Dashboard 文档中补 project key routing 和多租户权限边界。
 - `scripts/supabase-compat-check.mjs` 的兼容范围说明只到 `eq/limit`，已落后于 `postgrest.rs` 的解析能力。
-- `scripts/bootstrap-distributed-poc.sh` 对 `/v1/tokens` 和 `/v1/projects` 的调用没有 admin token，但当前 Rust HTTP 管理入口要求 admin/service_role。
+- `scripts/bootstrap-distributed-poc.sh` 已改为本地按 `SDB_JWT_SECRET` 签发 service/user JWT，再用 service_role 调用管理面；后续仍需要把它纳入 Docker 分布式 smoke test。
 - `tests/supabase-sdk.test.mjs` 需要与当前 `PolicySpec` 结构核对，避免测试声明覆盖但请求体不匹配。

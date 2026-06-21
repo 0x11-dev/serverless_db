@@ -21,6 +21,8 @@
 
 ## Review Findings
 
+> 当前代码更新（2026-06-21）：Rust HTTP 和 TypeScript POC 均已要求 `/v1/tokens`、`/v1/projects`、schema/table/policy/bucket、hibernate/crash、events/realtime 等管理面使用 `service_role`/admin token；`SDB_ENV=production` 下 `/v1/tokens` 禁用；Docker 分布式配置也要求显式提供 `SDB_JWT_SECRET`。下面 P0 finding 保留为历史 review context，后续仍需继续处理 TLS、CORS、密钥生命周期、控制面 RBAC 和审计。
+
 ### P0 - 公网管理面完全缺少鉴权
 
 证据：

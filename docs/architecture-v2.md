@@ -43,6 +43,10 @@ v2 不把 SQLite tier 包装成完整 Postgres：
 - 不把 Iceberg/Arrow/DuckDB 放入 OLTP 写路径。分析层只能从 outbox/export 派生。
 - 不把对象存储 list/overwrite 语义当作唯一的生产级协调机制。
 
+## 长期架构取向
+
+长期主线见 `docs/long-term-architecture-research.md`。结论是继续演进当前 D1/Turso-style `lite-serverless` data plane：借 D1 的 session/bookmark 一致性合同，借 Turso 的 SQLite/object-store 成本模型，按 Neon 的存储计算分离原则补齐 durable/control plane。若未来要完整 Supabase/Postgres parity，应作为独立 `postgres-serverless` tier，而不是把 SQLite core 包装成 Postgres。
+
 ## 组件边界
 
 | 组件 | v2 职责 | 当前仓库状态 | v2 需要补齐 |

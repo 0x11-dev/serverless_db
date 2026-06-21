@@ -120,7 +120,8 @@ async function mintToken(sub, role, claims = {}, expiresIn = 315360000) {
     return mintTokenLocal(sub, role, claims, expiresIn);
   }
   try {
-    const r = await assertOk("mint token", "POST", "/v1/tokens", { sub, role, claims, expires_in: expiresIn });
+    const mintingAdminToken = mintTokenLocal("admin", "service_role");
+    const r = await assertOk("mint token", "POST", "/v1/tokens", { sub, role, claims, expires_in: expiresIn }, mintingAdminToken);
     return r.data.token;
   } catch {
     return mintTokenLocal(sub, role, claims, expiresIn);
