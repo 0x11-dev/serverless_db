@@ -7,6 +7,11 @@
     "dev": "tsx src/server.ts --host 127.0.0.1 --port 8765 --runtime-dir .runtime",
     "start": "node dist/server.js --host 127.0.0.1 --port 8765 --runtime-dir .runtime",
     "build": "tsc -p tsconfig.json",
+    "dashboard:dev": "vite --config dashboard/vite.config.ts --host 127.0.0.1",
+    "dashboard:build": "vite build --config dashboard/vite.config.ts",
+    "dashboard:preview": "vite preview --config dashboard/vite.config.ts --host 127.0.0.1",
+    "dashboard:test": "tsx dashboard/tests/dashboard.test.ts",
+    "dashboard:typecheck": "tsc -p dashboard/tsconfig.json --noEmit",
     "test": "tsx tests/poc.test.ts",
     "demo": "tsx examples/demo.ts http://127.0.0.1:8765",
     "bench": "tsx bench/perf.ts",
@@ -25,12 +30,19 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.108.2",
-    "better-sqlite3": "^11.10.0"
+    "better-sqlite3": "^11.10.0",
+    "lucide-react": "^0.468.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
   },
   "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.15.30",
     "tsx": "^4.19.4",
-    "typescript": "^5.8.3"
+    "typescript": "^5.8.3",
+    "vite": "^6.0.0"
   }
 }
