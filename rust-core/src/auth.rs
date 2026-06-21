@@ -34,6 +34,14 @@ impl Actor {
     pub fn is_admin(&self) -> bool {
         self.role == "service_role" || self.role == "admin"
     }
+
+    pub fn is_anon(&self) -> bool {
+        self.role == "anon"
+    }
+
+    pub fn is_authenticated(&self) -> bool {
+        self.role != "anon"
+    }
 }
 
 pub fn mint_token(

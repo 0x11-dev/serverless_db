@@ -179,6 +179,19 @@ curl http://127.0.0.1:8765/health
 npm run demo
 ```
 
+Blog Platform 综合验证示例（覆盖全部功能）：
+
+```bash
+# 本地 dev server
+npm run example:blog
+
+# Docker 集群
+docker compose -f deploy/docker-compose.distributed.yml up -d --build
+docker compose -f deploy/docker-compose.distributed.yml run --rm blog-example
+```
+
+该示例模拟一个多租户博客平台，验证 health、JWT auth、多表 schema、Policy DSL 全部 7 种 rule、CRUD + 策略隔离、Storage 对象上传/下载/删除、Realtime outbox + SSE、Bookmark 一致性读、写幂等、Supabase SDK 兼容、Read replica 异步追赶 + 写转发、Hibernate/Crash 恢复。报告输出到 `reports/blog-app-verification-report.md`。
+
 ## 测试
 
 ```bash
@@ -197,6 +210,20 @@ TypeScript 旧实现仍可用：
 npm test
 npm run dev
 ```
+
+### Supabase JS SDK 兼容性测试
+
+使用真实 `@supabase/supabase-js` SDK 验证 PostgREST CRUD/筛选/变换、GoTrue Auth（注册/登录/登出/刷新/用户更新）、RLS 策略隔离、Storage 上传/下载/列表/删除：
+
+```bash
+# 终端 1：启动 Rust 服务
+npm run core:dev
+
+# 终端 2：运行 SDK 测试
+npm run test:sdk
+```
+
+49 项测试覆盖：PostgREST 基本 CRUD（select/insert/update/delete/upsert/single）、筛选器（eq/neq/gt/gte/lt/lte/in/like/ilike/is/not/链式 AND）、变换（order/limit/range/maybeSingle）、RLS 策略隔离（anon/authenticated 读写权限、用户只能操作自己的行）、GoTrue Auth（signUp/signInWithPassword/signOut/getUser/refreshSession/updateUser/重复注册拒绝/错误密码拒绝/不存在用户拒绝/user_metadata/auth settings）、Storage（bucket 创建/列表/删除、文件上传/下载/列表/删除）、Auth+PostgREST 集成。
 
 ## 性能验证
 
@@ -355,6 +382,79 @@ curl -s http://127.0.0.1:8765/v1/projects/demo/storage/files/hello.txt \
   -H "authorization: Bearer $TOKEN"
 ```
 
+#### Supabase Storage API (`/storage/v1`)
+
+```bash
+# Create bucket
+curl -s -X POST http://127.0.0.1:8765/storage/v1/buckets \
+  -H "apikey: $TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"name":"files"}'
+
+# List buckets
+curl -s http://127.0.0.1:8765/storage/v1/buckets -H "apikey: $TOKEN"
+
+# Upload object
+curl -s -X POST http://127.0.0.1:8765/storage/v1/object/files/hello.txt \
+  -H "apikey: $TOKEN" \
+  -H 'content-type: text/plain' \
+  --data-binary 'hello world'
+
+# Download object
+curl -s http://127.0.0.1:8765/storage/v1/object/files/hello.txt -H "apikey: $TOKEN"
+
+# List objects
+curl -s -X POST http://127.0.0.1:8765/storage/v1/object/list/files \
+  -H "apikey: $TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"limit":10,"offset":0}'
+
+# Delete object
+curl -s -X DELETE http://127.0.0.1:8765/storage/v1/object/files/hello.txt -H "apikey: $TOKEN"
+```
+
+#### GoTrue-compatible Auth API (`/auth/v1`)
+
+```bash
+# Sign up with email + password
+curl -s -X POST http://127.0.0.1:8765/auth/v1/signup \
+  -H "apikey: $ANON_KEY" \
+  -H 'content-type: application/json' \
+  -d '{"email":"user@example.com","password":"secret123"}'
+
+# Sign in with password
+curl -s -X POST http://127.0.0.1:8765/auth/v1/token?grant_type=password \
+  -H "apikey: $ANON_KEY" \
+  -H 'content-type: application/json' \
+  -d '{"email":"user@example.com","password":"secret123"}'
+
+# Get current user
+curl -s http://127.0.0.1:8765/auth/v1/user \
+  -H "apikey: $ANON_KEY" \
+  -H "authorization: Bearer $ACCESS_TOKEN"
+
+# Update user
+curl -s -X PUT http://127.0.0.1:8765/auth/v1/user \
+  -H "apikey: $ANON_KEY" \
+  -H "authorization: Bearer $ACCESS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"data":{"key":"value"}}'
+
+# Refresh session
+curl -s -X POST http://127.0.0.1:8765/auth/v1/token?grant_type=refresh_token \
+  -H "apikey: $ANON_KEY" \
+  -H 'content-type: application/json' \
+  -d '{"refresh_token":"$REFRESH_TOKEN"}'
+
+# Sign out (revoke current session)
+curl -s -X POST http://127.0.0.1:8765/auth/v1/logout \
+  -H "apikey: $ANON_KEY" \
+  -H "authorization: Bearer $ACCESS_TOKEN"
+
+# Auth settings
+curl -s http://127.0.0.1:8765/auth/v1/settings -H "apikey: $ANON_KEY"
+```
+
 ### Realtime / Outbox
 
 Polling：
@@ -367,6 +467,14 @@ SSE：
 
 ```bash
 curl -N http://127.0.0.1:8765/v1/projects/demo/realtime?since=0
+```
+
+#### Supabase Realtime SSE (`/realtime/v1/stream`)
+
+```bash
+# SSE stream (authenticated users, optional table filter)
+curl -N "http://127.0.0.1:8765/realtime/v1/stream?since=0&table=posts" \
+  -H "apikey: $TOKEN"
 ```
 
 ### Scale-to-zero 模拟
@@ -389,8 +497,8 @@ curl -s http://127.0.0.1:8765/v1/projects/demo/tables/notes -H "authorization: B
 
 ## 当前边界
 
-- 对象存储 adapter 已支持本地 filesystem 和可选 S3 feature（兼容 RustFS / AWS S3 等）；当前验证覆盖 local conformance、真实 RustFS/S3 conformance、Toxiproxy 延迟/断流/恢复场景、HTTP 503/429/408/partial response、transient 503/429 retry 幂等矩阵、WAL/manifest/snapshot PUT 阶段的本地故障注入，以及 9 场景进程级 crash matrix。真实 S3 multi-part failure、跨 region 行为仍待补。
-- durable path 使用 SQLite WAL segment + checksum manifest 追加到对象存储；已有 writer queue 和 durable WAL byte budget，但还不是多副本 quorum storage，GC 目前只删除 WAL prefix，尚未实现历史 snapshot 保留策略和异步 GC。
+- 对象存储 adapter 已支持本地 filesystem 和可选 S3 feature（兼容 RustFS / AWS S3 等）；HTTP 读路径已通过 `AsyncObjectStore` + `spawn_blocking` 实现异步 IO，避免阻塞 tokio 运行时。当前验证覆盖 local conformance、真实 RustFS/S3 conformance、Toxiproxy 延迟/断流/恢复场景、HTTP 503/429/408/partial response、transient 503/429 retry 幂等矩阵、WAL/manifest/snapshot PUT 阶段的本地故障注入，以及 9 场景进程级 crash matrix。真实 S3 multi-part failure、跨 region 行为仍待补。
+- durable path 使用 SQLite WAL segment + checksum manifest 追加到对象存储；已有 writer queue 和 durable WAL byte budget，writer lease 有后台续约线程、过期 claim GC 和 lease 冲突审计日志，但还不是多副本 quorum storage，GC 目前只删除 WAL prefix，尚未实现历史 snapshot 保留策略和异步 GC。
 - policy 是受限 DSL，不兼容任意 Postgres RLS expression。
 - SQLite 写路径仍是单库单写，适合低成本多小库，不适合单大库高并发写。
 - 没有实现 Postgres wire protocol、PostgREST、extensions、PL/pgSQL。

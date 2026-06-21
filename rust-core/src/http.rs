@@ -1,4 +1,6 @@
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use crate::auth::{actor_from_authorization, is_production, mint_token, verify_token};
+use crate::postgrest::CountMode;
 use crate::runtime::{ApiError, PolicySpec, ProjectRuntime, TableSpec, WriteIdempotency};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
@@ -53,6 +55,34 @@ pub fn app(runtime: ProjectRuntime) -> Router {
             "/v1/projects/{project_id}/storage/{bucket}/{*key}",
             put(put_object).get(get_object).delete(delete_object),
         )
+        .route(
+            "/storage/v1/buckets",
+            post(supabase_create_bucket).get(supabase_list_buckets),
+        )
+        .route(
+            "/storage/v1/buckets/{bucket_id}",
+            get(supabase_get_bucket).delete(supabase_delete_bucket),
+        )
+        .route(
+            "/storage/v1/object/{bucket_id}/{*key}",
+            post(supabase_upload_object)
+                .get(supabase_download_object)
+                .put(supabase_upload_object)
+                .delete(supabase_delete_object),
+        )
+        .route(
+            "/storage/v1/object/list/{bucket_id}",
+            post(supabase_list_objects),
+        )
+        .route(
+            "/realtime/v1/stream",
+            get(supabase_realtime_stream),
+        )
+        .route("/auth/v1/signup", post(auth_signup))
+        .route("/auth/v1/token", post(auth_token))
+        .route("/auth/v1/logout", post(auth_logout))
+        .route("/auth/v1/user", get(auth_get_user).put(auth_update_user))
+        .route("/auth/v1/settings", get(auth_settings))
         .with_state(state)
 }
 
@@ -504,7 +534,7 @@ async fn supabase_insert_rows(
             inserted.push(row);
         }
     }
-    Ok(supabase_json(Value::Array(inserted), &headers))
+    Ok(supabase_json_with_prefer(Value::Array(inserted), None, &headers, PreferReturn::Default, 0))
 }
 
 async fn supabase_update_rows(
@@ -532,7 +562,10 @@ async fn supabase_update_rows(
         &actor,
         idempotency,
     )?;
-    Ok(supabase_rows_json(value, &headers))
+    let affected = value.get("affected").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let rows = value.get("rows").cloned().unwrap_or(Value::Array(Vec::new()));
+    let prefer = prefer_return(&headers);
+    Ok(supabase_json_with_prefer(rows, None, &headers, prefer, affected))
 }
 
 async fn supabase_delete_rows(
@@ -552,7 +585,10 @@ async fn supabase_delete_rows(
     let idempotency = write_idempotency("DELETE", &uri, &headers, "", &[])?;
     let value =
         runtime.delete_rows_postgrest(&project_id, &table, &filters, &actor, idempotency)?;
-    Ok(supabase_rows_json(value, &headers))
+    let affected = value.get("affected").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let rows = value.get("rows").cloned().unwrap_or(Value::Array(Vec::new()));
+    let prefer = prefer_return(&headers);
+    Ok(supabase_json_with_prefer(rows, None, &headers, prefer, affected))
 }
 
 async fn put_object(
@@ -618,6 +654,160 @@ async fn delete_object(
     ))
 }
 
+async fn supabase_create_bucket(
+    State(runtime): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, HttpError> {
+    let project_id = runtime.supabase_project_id().to_string();
+    let name = body
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HttpError(ApiError::new(400, "missing 'name' field")))?;
+    let idempotency = write_idempotency(
+        "POST",
+        &format!("/storage/v1/buckets/{name}"),
+        &headers,
+        "application/json",
+        &[],
+    )?;
+    Ok(local_json(
+        &runtime,
+        runtime.create_bucket_with_idempotency(&project_id, name, idempotency)?,
+    ))
+}
+
+async fn supabase_list_buckets(
+    State(runtime): State<AppState>,
+    _headers: HeaderMap,
+) -> Result<Json<Value>, HttpError> {
+    let project_id = runtime.supabase_project_id().to_string();
+    Ok(Json(runtime.list_buckets_async(&project_id).await?))
+}
+
+async fn supabase_get_bucket(
+    State(runtime): State<AppState>,
+    Path(bucket_id): Path<String>,
+    _headers: HeaderMap,
+) -> Result<Json<Value>, HttpError> {
+    let project_id = runtime.supabase_project_id().to_string();
+    Ok(local_json(
+        &runtime,
+        runtime.get_bucket_async(&project_id, &bucket_id).await?,
+    ))
+}
+
+async fn supabase_delete_bucket(
+    State(runtime): State<AppState>,
+    Path(bucket_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, HttpError> {
+    let project_id = runtime.supabase_project_id().to_string();
+    let uri = format!("/storage/v1/buckets/{bucket_id}");
+    if should_forward_write(&runtime) {
+        return forward_json(&runtime, "DELETE", &uri, &headers, Vec::new()).await;
+    }
+    let idempotency = write_idempotency("DELETE", &uri, &headers, "", &[])?;
+    let _ = idempotency;
+    Ok(local_json(
+        &runtime,
+        runtime.delete_bucket(&project_id, &bucket_id)?,
+    ))
+}
+
+async fn supabase_upload_object(
+    State(runtime): State<AppState>,
+    Path((bucket_id, key)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, HttpError> {
+    let project_id = runtime.supabase_project_id().to_string();
+    let uri = format!("/storage/v1/object/{bucket_id}/{key}");
+    if should_forward_write(&runtime) {
+        return forward_json(&runtime, "POST", &uri, &headers, body.to_vec()).await;
+    }
+    let actor = actor(&headers)?;
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let idempotency = write_idempotency("POST", &uri, &headers, &content_type, &body)?;
+    Ok(local_json(
+        &runtime,
+        runtime.put_object_with_idempotency(
+            &project_id,
+            &bucket_id,
+            &key,
+            &body,
+            &content_type,
+            &actor,
+            idempotency,
+        )?,
+    ))
+}
+
+async fn supabase_download_object(
+    State(runtime): State<AppState>,
+    Path((bucket_id, key)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, HttpError> {
+    let project_id = runtime.supabase_project_id().to_string();
+    let actor = actor(&headers)?;
+    let object = runtime.get_object_async(&project_id, &bucket_id, &key, &actor).await?;
+    let content_type = object
+        .meta
+        .get("content_type")
+        .and_then(Value::as_str)
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    Ok(([(header::CONTENT_TYPE, content_type)], object.data).into_response())
+}
+
+async fn supabase_delete_object(
+    State(runtime): State<AppState>,
+    Path((bucket_id, key)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, HttpError> {
+    let project_id = runtime.supabase_project_id().to_string();
+    let uri = format!("/storage/v1/object/{bucket_id}/{key}");
+    if should_forward_write(&runtime) {
+        return forward_json(&runtime, "DELETE", &uri, &headers, Vec::new()).await;
+    }
+    let actor = actor(&headers)?;
+    let idempotency = write_idempotency("DELETE", &uri, &headers, "", &[])?;
+    Ok(local_json(
+        &runtime,
+        runtime.delete_object_with_idempotency(&project_id, &bucket_id, &key, &actor, idempotency)?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct SupabaseListObjectsRequest {
+    #[serde(default)]
+    prefix: Option<String>,
+    #[serde(default)]
+    limit: Option<i64>,
+    #[serde(default)]
+    offset: Option<i64>,
+}
+
+async fn supabase_list_objects(
+    State(runtime): State<AppState>,
+    Path(bucket_id): Path<String>,
+    _headers: HeaderMap,
+    Json(body): Json<SupabaseListObjectsRequest>,
+) -> Result<Json<Value>, HttpError> {
+    let project_id = runtime.supabase_project_id().to_string();
+    Ok(Json(runtime.list_objects_async(
+        &project_id,
+        &bucket_id,
+        body.prefix.as_deref(),
+        body.limit.unwrap_or(100),
+        body.offset.unwrap_or(0),
+    ).await?))
+}
+
 #[derive(Debug, Deserialize)]
 struct EventsQuery {
     #[serde(default)]
@@ -680,6 +870,74 @@ async fn realtime(
                 .id(id)
                 .event(operation)
                 .data(event.to_string()))
+        });
+    Ok(Sse::new(futures_util::stream::iter(items)))
+}
+
+#[derive(Debug, Deserialize)]
+struct SupabaseRealtimeQuery {
+    #[serde(default)]
+    since: i64,
+    #[serde(default)]
+    table: Option<String>,
+}
+
+async fn supabase_realtime_stream(
+    State(runtime): State<AppState>,
+    Query(query): Query<SupabaseRealtimeQuery>,
+    headers: HeaderMap,
+) -> Result<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>>, HttpError> {
+    let actor = actor(&headers)?;
+    if actor.is_anon() {
+        return Err(HttpError(ApiError::new(
+            403,
+            "realtime stream requires authenticated or service_role",
+        )));
+    }
+    let project_id = runtime.supabase_project_id().to_string();
+    let events = runtime.wait_for_events(&project_id, query.since).await?;
+    let table_filter = query.table.clone();
+    let items = events
+        .get("events")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(move |event| {
+            if let Some(ref table) = table_filter {
+                event.get("table").and_then(Value::as_str) == Some(table.as_str())
+            } else {
+                true
+            }
+        })
+        .map(|event| {
+            let id = event
+                .get("id")
+                .and_then(Value::as_i64)
+                .unwrap_or_default()
+                .to_string();
+            let operation = event
+                .get("operation")
+                .and_then(Value::as_str)
+                .unwrap_or("message")
+                .to_string();
+            let table = event
+                .get("table")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let record = event.get("row").cloned().unwrap_or(Value::Null);
+            let payload = json!({
+                "type": operation,
+                "table": table,
+                "schema": "public",
+                "record": record,
+                "old": null
+            });
+            Ok(Event::default()
+                .id(id)
+                .event(operation)
+                .data(payload.to_string()))
         });
     Ok(Sse::new(futures_util::stream::iter(items)))
 }
@@ -805,6 +1063,58 @@ fn normalize_supabase_insert_body(body: Value) -> Result<Vec<Value>, HttpError> 
     }
 }
 
+fn prefer_return(headers: &HeaderMap) -> PreferReturn {
+    headers
+        .get("prefer")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            if v.contains("return=representation") {
+                PreferReturn::Representation
+            } else if v.contains("return=minimal") {
+                PreferReturn::Minimal
+            } else {
+                PreferReturn::Default
+            }
+        })
+        .unwrap_or(PreferReturn::Default)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreferReturn {
+    Default,
+    Minimal,
+    Representation,
+}
+
+fn prefer_count(headers: &HeaderMap) -> CountMode {
+    headers
+        .get("prefer")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            if v.contains("count=exact") {
+                Some(CountMode::Exact)
+            } else if v.contains("count=planned") {
+                Some(CountMode::Planned)
+            } else if v.contains("count=estimated") {
+                Some(CountMode::Estimated)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(CountMode::None)
+}
+
+fn content_range_header(start: usize, end: Option<usize>, total: Option<usize>) -> String {
+    let range = match end {
+        Some(e) => format!("{}-{}", start, e),
+        None => format!("{}-*", start),
+    };
+    match total {
+        Some(t) => format!("{range}/{t}"),
+        None => format!("{range}/*"),
+    }
+}
+
 fn supabase_rows_json(value: Value, headers: &HeaderMap) -> Response {
     let bookmark = value
         .get("bookmark")
@@ -814,11 +1124,81 @@ fn supabase_rows_json(value: Value, headers: &HeaderMap) -> Response {
         .get("rows")
         .cloned()
         .unwrap_or_else(|| Value::Array(Vec::new()));
+
+    let accept = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if accept.contains("vnd.pgrst.object+json") {
+        let single = if let Some(arr) = rows.as_array() {
+            if arr.is_empty() {
+                Value::Null
+            } else {
+                arr[0].clone()
+            }
+        } else {
+            rows.clone()
+        };
+        return supabase_json_with_bookmark(single, bookmark.as_deref(), headers);
+    }
+
     supabase_json_with_bookmark(rows, bookmark.as_deref(), headers)
 }
 
 fn supabase_json(value: Value, headers: &HeaderMap) -> Response {
     supabase_json_with_bookmark(value, None, headers)
+}
+
+fn supabase_json_with_prefer(
+    value: Value,
+    bookmark: Option<&str>,
+    headers: &HeaderMap,
+    prefer: PreferReturn,
+    affected: usize,
+) -> Response {
+    if prefer == PreferReturn::Minimal {
+        let origin = cors_origin(headers);
+        let mut response = (
+            StatusCode::NO_CONTENT,
+            [
+                (header::ACCESS_CONTROL_ALLOW_ORIGIN, origin.as_str()),
+                (
+                    header::ACCESS_CONTROL_EXPOSE_HEADERS,
+                    "content-range, x-sdb-bookmark, x-d1-bookmark",
+                ),
+            ],
+        )
+            .into_response();
+        if affected > 0 {
+            let range = content_range_header(0, Some(affected - 1), Some(affected));
+            if let Ok(val) = range.parse() {
+                response.headers_mut().insert("content-range", val);
+            }
+        }
+        if let Some(bookmark) = bookmark {
+            if let Ok(val) = bookmark.parse() {
+                response.headers_mut().insert("x-sdb-bookmark", val);
+            }
+        }
+        return response;
+    }
+    supabase_json_with_bookmark(unwrap_single(value, headers), bookmark, headers)
+}
+
+fn unwrap_single(value: Value, headers: &HeaderMap) -> Value {
+    let accept = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if accept.contains("vnd.pgrst.object+json") {
+        if let Some(arr) = value.as_array() {
+            if arr.is_empty() {
+                return Value::Null;
+            }
+            return arr[0].clone();
+        }
+    }
+    value
 }
 
 fn cors_origin(headers: &HeaderMap) -> String {
@@ -1359,6 +1739,391 @@ fn percent_encode(value: &str) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// GoTrue-compatible auth endpoints (/auth/v1/*)
+// ---------------------------------------------------------------------------
+
+fn hash_password(password: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(password.as_bytes());
+    URL_SAFE_NO_PAD.encode(hasher.finalize())
+}
+
+fn gen_uuid() -> String {
+    let mut buf = [0u8; 16];
+    use std::io::Read;
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let _ = f.read_exact(&mut buf);
+    } else {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = ((now >> (i * 8)) & 0xff) as u8;
+        }
+    }
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        buf[0], buf[1], buf[2], buf[3],
+        buf[4], buf[5],
+        buf[6], buf[7],
+        buf[8], buf[9],
+        buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]
+    )
+}
+
+fn gen_refresh_token() -> String {
+    let mut buf = [0u8; 32];
+    use std::io::Read;
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let _ = f.read_exact(&mut buf);
+    } else {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = ((now >> (i % 16 * 8)) & 0xff) as u8;
+        }
+    }
+    URL_SAFE_NO_PAD.encode(buf)
+}
+
+fn now_iso() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let (y, mo, d, h, mi, s) = unix_to_datetime(secs as i64);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+fn unix_to_datetime(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
+    let days = secs / 86400;
+    let rem = secs % 86400;
+    let h = (rem / 3600) as u32;
+    let mi = ((rem % 3600) / 60) as u32;
+    let s = (rem % 60) as u32;
+    let (y, mo, d) = days_to_ymd(days);
+    (y, mo, d, h, mi, s)
+}
+
+fn days_to_ymd(days: i64) -> (i64, u32, u32) {
+    let mut y = 1970i64;
+    let mut remaining = days;
+    loop {
+        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        let dy = if leap { 366 } else { 365 };
+        if remaining < dy {
+            break;
+        }
+        remaining -= dy;
+        y += 1;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let months = if leap {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let mut mo = 0u32;
+    for (i, &dm) in months.iter().enumerate() {
+        if remaining < dm as i64 {
+            mo = (i + 1) as u32;
+            break;
+        }
+        remaining -= dm as i64;
+    }
+    (y, mo, (remaining + 1) as u32)
+}
+
+fn public_user(user: &Value) -> Value {
+    let mut out = user.clone();
+    if let Some(obj) = out.as_object_mut() {
+        obj.remove("password_hash");
+    }
+    out
+}
+
+fn auth_users(state: &AppState) -> std::sync::MutexGuard<'_, HashMap<String, Value>> {
+    state.auth_users().lock().unwrap()
+}
+
+fn auth_refresh_tokens(
+    state: &AppState,
+) -> std::sync::MutexGuard<'_, HashMap<String, Value>> {
+    state.auth_refresh_tokens().lock().unwrap()
+}
+
+fn user_to_json(user: &Value) -> Value {
+    user.clone()
+}
+
+fn build_session(user: &Value, state: &AppState) -> Value {
+    let user_id = user
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let email = user
+        .get("email")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let phone = user.get("phone").and_then(Value::as_str);
+
+    let access_token = mint_token(
+        user_id,
+        "authenticated",
+        {
+            let mut m = Map::new();
+            m.insert("email".to_string(), Value::String(email.to_string()));
+            if let Some(p) = phone {
+                m.insert("phone".to_string(), Value::String(p.to_string()));
+            }
+            m
+        },
+        Some(3600),
+    )
+    .unwrap_or_default();
+
+    let refresh_token = gen_refresh_token();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    {
+        let mut rt = auth_refresh_tokens(state);
+        rt.insert(
+            refresh_token.clone(),
+            json!({
+                "token": refresh_token,
+                "user_id": user_id,
+                "created_at": now,
+            }),
+        );
+    }
+
+    json!({
+        "access_token": access_token,
+        "token_type": "bearer",
+        "expires_in": 3600,
+        "expires_at": now + 3600,
+        "refresh_token": refresh_token,
+        "user": user_to_json(user),
+    })
+}
+
+async fn auth_signup(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, HttpError> {
+    let email = body
+        .get("email")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HttpError(ApiError::new(400, "missing email")))?;
+    let password = body
+        .get("password")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HttpError(ApiError::new(400, "missing password")))?;
+
+    {
+        let users = auth_users(&state);
+        if users.contains_key(email) {
+            return Err(HttpError(ApiError::new(
+                400,
+                "User already registered",
+            )));
+        }
+    }
+
+    let now = now_iso();
+    let user = json!({
+        "id": gen_uuid(),
+        "email": email,
+        "phone": body.get("phone"),
+        "password_hash": hash_password(password),
+        "user_metadata": body.get("data").cloned().unwrap_or(json!({})),
+        "app_metadata": {},
+        "aud": "authenticated",
+        "role": "authenticated",
+        "created_at": now,
+        "email_confirmed_at": now,
+        "last_sign_in_at": now,
+        "updated_at": now,
+    });
+
+    {
+        let mut users = auth_users(&state);
+        users.insert(email.to_string(), user.clone());
+    }
+
+    let session = build_session(&user, &state);
+    Ok(Json(session))
+}
+
+async fn auth_token(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, HttpError> {
+    let grant_type = query
+        .get("grant_type")
+        .map(String::as_str)
+        .unwrap_or("password");
+
+    match grant_type {
+        "password" => {
+            let email = body
+                .get("email")
+                .or_else(|| body.get("phone"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| HttpError(ApiError::new(400, "missing email or phone")))?;
+            let password = body
+                .get("password")
+                .and_then(Value::as_str)
+                .ok_or_else(|| HttpError(ApiError::new(400, "missing password")))?;
+
+            let pw_hash = hash_password(password);
+            let user = {
+                let users = auth_users(&state);
+                users
+                    .get(email)
+                    .filter(|u| {
+                        u.get("password_hash")
+                            .and_then(Value::as_str)
+                            .map(|h| h == pw_hash)
+                            .unwrap_or(false)
+                    })
+                    .cloned()
+            };
+
+            let user = user.ok_or_else(|| {
+                HttpError(ApiError::new(401, "Invalid login credentials"))
+            })?;
+
+            let session = build_session(&user, &state);
+            Ok(Json(session))
+        }
+        "refresh_token" => {
+            let refresh_token = body
+                .get("refresh_token")
+                .and_then(Value::as_str)
+                .ok_or_else(|| HttpError(ApiError::new(400, "missing refresh_token")))?;
+
+            let user_id = {
+                let rt = auth_refresh_tokens(&state);
+                rt.get(refresh_token)
+                    .and_then(|e| e.get("user_id"))
+                    .and_then(Value::as_str)
+                    .map(String::from)
+            };
+
+            let user_id = user_id.ok_or_else(|| {
+                HttpError(ApiError::new(401, "Invalid refresh token"))
+            })?;
+
+            let user = {
+                let users = auth_users(&state);
+                users
+                    .values()
+                    .find(|u| {
+                        u.get("id").and_then(Value::as_str) == Some(&user_id)
+                    })
+                    .cloned()
+            };
+
+            let user = user.ok_or_else(|| {
+                HttpError(ApiError::new(401, "User not found"))
+            })?;
+
+            {
+                let mut rt = auth_refresh_tokens(&state);
+                rt.remove(refresh_token);
+            }
+
+            let session = build_session(&user, &state);
+            Ok(Json(session))
+        }
+        _ => Err(HttpError(ApiError::new(400, "unsupported grant_type"))),
+    }
+}
+
+async fn auth_logout() -> Result<Json<Value>, HttpError> {
+    Ok(Json(json!({})))
+}
+
+async fn auth_get_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, HttpError> {
+    let actor = actor(&headers)?;
+    let user_id = actor
+        .sub
+        .as_ref()
+        .ok_or_else(|| HttpError(ApiError::new(401, "no user associated with token")))?;
+
+    let user = {
+        let users = auth_users(&state);
+        users
+            .values()
+            .find(|u| u.get("id").and_then(Value::as_str) == Some(user_id))
+            .cloned()
+    };
+
+    match user {
+        Some(u) => Ok(Json(json!({ "user": public_user(&u) }))),
+        None => Ok(Json(json!({ "user": null }))),
+    }
+}
+
+async fn auth_update_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, HttpError> {
+    let actor = actor(&headers)?;
+    let user_id = actor
+        .sub
+        .as_ref()
+        .ok_or_else(|| HttpError(ApiError::new(401, "no user associated with token")))?;
+
+    let mut users = auth_users(&state);
+    let email_key = users
+        .iter()
+        .find(|(_, u)| u.get("id").and_then(Value::as_str) == Some(user_id))
+        .map(|(k, _)| k.clone())
+        .ok_or_else(|| HttpError(ApiError::new(404, "User not found")))?;
+
+    let user = users.get_mut(&email_key).unwrap();
+    if let Some(email) = body.get("email").and_then(Value::as_str) {
+        user["email"] = Value::String(email.to_string());
+    }
+    if let Some(phone) = body.get("phone").and_then(Value::as_str) {
+        user["phone"] = Value::String(phone.to_string());
+    }
+    if let Some(password) = body.get("password").and_then(Value::as_str) {
+        user["password_hash"] = Value::String(hash_password(password));
+    }
+    if let Some(data) = body.get("data") {
+        user["user_metadata"] = data.clone();
+    }
+
+    Ok(Json(json!({ "user": public_user(user) })))
+}
+
+async fn auth_settings() -> Result<Json<Value>, HttpError> {
+    Ok(Json(json!({
+        "external": {},
+        "disable_signup": false,
+        "mailer_autoconfirm": true,
+        "phone_autoconfirm": true,
+        "sms_provider": "",
+        "mfa": {},
+        "saml_enabled": false,
+    })))
+}
+
 #[derive(Debug)]
 pub struct HttpError(pub ApiError);
 
@@ -1378,7 +2143,36 @@ impl IntoResponse for HttpError {
     fn into_response(self) -> Response {
         let status =
             StatusCode::from_u16(self.0.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        (status, Json(json!({ "error": self.0.message }))).into_response()
+        let code = match self.0.status {
+            400 => "22023",
+            401 => "42P17",
+            403 => "42501",
+            404 => "42P01",
+            409 => "23P01",
+            425 => "55P03",
+            500 => "XX000",
+            502 => "08006",
+            503 => "57P03",
+            504 => "57014",
+            _ => "XX000",
+        };
+        let hint = if self.0.status == 401 {
+            Some("Provide a valid Authorization header with a Bearer token or an apikey header.")
+        } else if self.0.status == 403 {
+            Some("Ensure the token has the required role (service_role or admin).")
+        } else {
+            None
+        };
+        (
+            status,
+            Json(json!({
+                "code": code,
+                "message": self.0.message,
+                "details": null,
+                "hint": hint,
+            })),
+        )
+            .into_response()
     }
 }
 
@@ -1840,6 +2634,184 @@ mod tests {
         .unwrap();
         let selected = response_json(selected).await;
         assert_eq!(selected[0]["title"], "apikey-only");
+    }
+
+    #[tokio::test]
+    async fn postgrest_order_and_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = ProjectRuntime::new(
+            dir.path().join("runtime"),
+            RuntimeOptions {
+                writer_lease_ttl_ms: 0,
+                ..RuntimeOptions::default()
+            },
+        )
+        .unwrap();
+        setup_notes(&runtime);
+        let runtime = Arc::new(runtime);
+        for i in 0..5 {
+            let mut q = HashMap::new();
+            q.insert("select".to_string(), "*".to_string());
+            supabase_insert_rows(
+                State(runtime.clone()),
+                Path("notes".to_string()),
+                Query(q),
+                auth_headers(),
+                Json(json!({"owner_id":"alice","title":format!("row-{i}")})),
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut q = HashMap::new();
+        q.insert("select".to_string(), "*".to_string());
+        q.insert("order".to_string(), "title.desc".to_string());
+        q.insert("offset".to_string(), "1".to_string());
+        q.insert("limit".to_string(), "2".to_string());
+        let selected = supabase_select_rows(
+            State(runtime.clone()),
+            Path("notes".to_string()),
+            Query(q),
+            auth_headers(),
+        )
+        .await
+        .unwrap();
+        let selected = response_json(selected).await;
+        let arr = selected.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["title"], "row-3");
+        assert_eq!(arr[1]["title"], "row-2");
+    }
+
+    #[tokio::test]
+    async fn postgrest_neq_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = ProjectRuntime::new(
+            dir.path().join("runtime"),
+            RuntimeOptions {
+                writer_lease_ttl_ms: 0,
+                ..RuntimeOptions::default()
+            },
+        )
+        .unwrap();
+        setup_notes(&runtime);
+        let runtime = Arc::new(runtime);
+        for title in ["alpha", "beta", "gamma"] {
+            let mut q = HashMap::new();
+            q.insert("select".to_string(), "*".to_string());
+            supabase_insert_rows(
+                State(runtime.clone()),
+                Path("notes".to_string()),
+                Query(q),
+                auth_headers(),
+                Json(json!({"owner_id":"alice","title":title})),
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut q = HashMap::new();
+        q.insert("select".to_string(), "*".to_string());
+        q.insert("title".to_string(), "neq.alpha".to_string());
+        let selected = supabase_select_rows(
+            State(runtime.clone()),
+            Path("notes".to_string()),
+            Query(q),
+            auth_headers(),
+        )
+        .await
+        .unwrap();
+        let selected = response_json(selected).await;
+        let arr = selected.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        for row in arr {
+            assert_ne!(row["title"], "alpha");
+        }
+    }
+
+    #[tokio::test]
+    async fn postgrest_or_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = ProjectRuntime::new(
+            dir.path().join("runtime"),
+            RuntimeOptions {
+                writer_lease_ttl_ms: 0,
+                ..RuntimeOptions::default()
+            },
+        )
+        .unwrap();
+        setup_notes(&runtime);
+        let runtime = Arc::new(runtime);
+        for title in ["alpha", "beta", "gamma"] {
+            let mut q = HashMap::new();
+            q.insert("select".to_string(), "*".to_string());
+            supabase_insert_rows(
+                State(runtime.clone()),
+                Path("notes".to_string()),
+                Query(q),
+                auth_headers(),
+                Json(json!({"owner_id":"alice","title":title})),
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut q = HashMap::new();
+        q.insert("select".to_string(), "*".to_string());
+        q.insert("or".to_string(), "title.eq.alpha,title.eq.gamma".to_string());
+        let selected = supabase_select_rows(
+            State(runtime.clone()),
+            Path("notes".to_string()),
+            Query(q),
+            auth_headers(),
+        )
+        .await
+        .unwrap();
+        let selected = response_json(selected).await;
+        let arr = selected.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn postgrest_select_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = ProjectRuntime::new(
+            dir.path().join("runtime"),
+            RuntimeOptions {
+                writer_lease_ttl_ms: 0,
+                ..RuntimeOptions::default()
+            },
+        )
+        .unwrap();
+        setup_notes(&runtime);
+        let runtime = Arc::new(runtime);
+        let mut q = HashMap::new();
+        q.insert("select".to_string(), "*".to_string());
+        supabase_insert_rows(
+            State(runtime.clone()),
+            Path("notes".to_string()),
+            Query(q.clone()),
+            auth_headers(),
+            Json(json!({"owner_id":"alice","title":"proj-test"})),
+        )
+        .await
+        .unwrap();
+
+        q.insert("select".to_string(), "title".to_string());
+        q.insert("title".to_string(), "eq.proj-test".to_string());
+        let selected = supabase_select_rows(
+            State(runtime.clone()),
+            Path("notes".to_string()),
+            Query(q),
+            auth_headers(),
+        )
+        .await
+        .unwrap();
+        let selected = response_json(selected).await;
+        let arr = selected.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["title"], "proj-test");
+        assert!(arr[0].get("owner_id").is_none());
     }
 
     #[tokio::test]
@@ -2341,5 +3313,213 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn supabase_storage_bucket_crud() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = ProjectRuntime::new(dir.path().join("r"), RuntimeOptions::default()).unwrap();
+        runtime.create_project("demo").unwrap();
+        let runtime = Arc::new(runtime);
+
+        let created = supabase_create_bucket(
+            State(runtime.clone()),
+            admin_headers(),
+            Json(json!({"name":"test_bucket"})),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let created = response_json(created).await;
+        assert_eq!(created["bucket"], "test_bucket");
+
+        let buckets = supabase_list_buckets(
+            State(runtime.clone()),
+            admin_headers(),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let buckets = response_json(buckets).await;
+        let arr = buckets.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"], "test_bucket");
+
+        let bucket = supabase_get_bucket(
+            State(runtime.clone()),
+            Path("test_bucket".to_string()),
+            admin_headers(),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let bucket = response_json(bucket).await;
+        assert_eq!(bucket["name"], "test_bucket");
+
+        let deleted = supabase_delete_bucket(
+            State(runtime.clone()),
+            Path("test_bucket".to_string()),
+            admin_headers(),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let deleted = response_json(deleted).await;
+        assert_eq!(deleted["deleted"], true);
+    }
+
+    #[tokio::test]
+    async fn supabase_storage_object_upload_download_list_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = ProjectRuntime::new(dir.path().join("r"), RuntimeOptions::default()).unwrap();
+        runtime.create_project("demo").unwrap();
+        let runtime = Arc::new(runtime);
+
+        supabase_create_bucket(
+            State(runtime.clone()),
+            admin_headers(),
+            Json(json!({"name":"files"})),
+        )
+        .await
+        .unwrap();
+
+        let mut upload_headers = admin_headers();
+        upload_headers.insert(header::CONTENT_TYPE, "text/plain".parse().unwrap());
+        let uploaded = supabase_upload_object(
+            State(runtime.clone()),
+            Path(("files".to_string(), "hello.txt".to_string())),
+            upload_headers.clone(),
+            Bytes::from("hello world"),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let uploaded = response_json(uploaded).await;
+        assert_eq!(uploaded["object"]["key"], "hello.txt");
+
+        let result = supabase_download_object(
+            State(runtime.clone()),
+            Path(("files".to_string(), "hello.txt".to_string())),
+            admin_headers(),
+        )
+        .await
+        .unwrap();
+        let body = axum::body::to_bytes(result.into_body(), 1024).await.unwrap();
+        assert_eq!(body.as_ref(), b"hello world");
+
+        let objects = supabase_list_objects(
+            State(runtime.clone()),
+            Path("files".to_string()),
+            admin_headers(),
+            Json(SupabaseListObjectsRequest {
+                prefix: None,
+                limit: Some(10),
+                offset: Some(0),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let objects = response_json(objects).await;
+        let arr = objects.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["key"], "hello.txt");
+
+        let deleted = supabase_delete_object(
+            State(runtime.clone()),
+            Path(("files".to_string(), "hello.txt".to_string())),
+            admin_headers(),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let deleted = response_json(deleted).await;
+        assert_eq!(deleted["deleted"], true);
+
+        let err = supabase_download_object(
+            State(runtime.clone()),
+            Path(("files".to_string(), "hello.txt".to_string())),
+            admin_headers(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0.status, 404);
+    }
+
+    #[tokio::test]
+    async fn supabase_realtime_stream_rejects_anon() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = ProjectRuntime::new(dir.path().join("r"), RuntimeOptions::default()).unwrap();
+        runtime.create_project("demo").unwrap();
+        let err = supabase_realtime_stream(
+            State(Arc::new(runtime)),
+            Query(SupabaseRealtimeQuery { since: 0, table: None }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0.status, 403);
+    }
+
+    #[tokio::test]
+    async fn supabase_realtime_stream_returns_events_for_authenticated() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = ProjectRuntime::new(dir.path().join("r"), RuntimeOptions::default()).unwrap();
+        runtime.create_project("demo").unwrap();
+        let runtime = Arc::new(runtime);
+
+        let table = TableSpec {
+            name: "posts".to_string(),
+            columns: vec![
+                ColumnSpec {
+                    name: "id".to_string(),
+                    r#type: "integer".to_string(),
+                    primary_key: true,
+                    auto_increment: true,
+                    not_null: true,
+                },
+                ColumnSpec {
+                    name: "title".to_string(),
+                    r#type: "text".to_string(),
+                    primary_key: false,
+                    auto_increment: false,
+                    not_null: true,
+                },
+            ],
+        };
+        create_table(
+            State(runtime.clone()),
+            Path("demo".to_string()),
+            admin_headers(),
+            Json(table),
+        )
+        .await
+        .unwrap();
+
+        let mut q = HashMap::new();
+        supabase_insert_rows(
+            State(runtime.clone()),
+            Path("posts".to_string()),
+            Query(q.clone()),
+            auth_headers(),
+            Json(json!({"title": "hello world"})),
+        )
+        .await
+        .unwrap();
+
+        let response = supabase_realtime_stream(
+            State(runtime.clone()),
+            Query(SupabaseRealtimeQuery { since: 0, table: None }),
+            auth_headers(),
+        )
+        .await
+        .unwrap()
+        .into_response();
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("event: insert"));
+        assert!(body_str.contains("\"table\":\"posts\""));
+        assert!(body_str.contains("\"record\""));
     }
 }

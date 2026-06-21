@@ -1,5 +1,5 @@
 use crate::auth::Actor;
-use crate::object_store::{LocalObjectStore, ObjectStoreRef};
+use crate::object_store::{AsyncObjectStore, LocalObjectStore, ObjectStoreRef};
 use crate::policy::{compile_policies, evaluate_policies, quote_ident, valid_ident};
 use crate::postgrest::{self, SelectQuery};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -134,6 +134,7 @@ pub struct ProjectRuntime {
     runtime_dir: PathBuf,
     cache_dir: PathBuf,
     object_store: ObjectStoreRef,
+    async_store: AsyncObjectStore,
     options: RuntimeOptions,
     forward_client: reqwest::Client,
     forward_trace_seq: Arc<AtomicU64>,
@@ -141,6 +142,8 @@ pub struct ProjectRuntime {
     runtime_id: String,
     states: Arc<Mutex<HashMap<String, Arc<ProjectHandle>>>>,
     notifiers: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+    auth_users: Arc<Mutex<HashMap<String, serde_json::Value>>>,
+    auth_refresh_tokens: Arc<Mutex<HashMap<String, serde_json::Value>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -155,6 +158,8 @@ struct ProjectHandle {
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     replica_stop: Mutex<Option<mpsc::Sender<()>>>,
     replica_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    lease_renewer_stop: Mutex<Option<mpsc::Sender<()>>>,
+    lease_renewer_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl ProjectHandle {
@@ -179,6 +184,12 @@ impl ProjectHandle {
             worker
                 .join()
                 .map_err(|_| ApiError::new(500, "project replica worker panicked"))?;
+        }
+        self.lease_renewer_stop.lock().unwrap().take();
+        if let Some(worker) = self.lease_renewer_worker.lock().unwrap().take() {
+            worker
+                .join()
+                .map_err(|_| ApiError::new(500, "project lease renewer panicked"))?;
         }
         Ok(())
     }
@@ -215,6 +226,12 @@ struct DurableManifest {
     schema_version: u32,
     project_id: String,
     generation: u64,
+    #[serde(default)]
+    previous_generation: u64,
+    #[serde(default)]
+    fencing_token: Option<u64>,
+    #[serde(default)]
+    owner_id: Option<String>,
     #[serde(default)]
     commit_seq: u64,
     #[serde(default)]
@@ -301,6 +318,9 @@ enum WriteJobKind {
         key: String,
         actor: Actor,
     },
+    DeleteBucket {
+        name: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -372,10 +392,12 @@ impl ProjectRuntime {
         let cache_dir = runtime_dir.join("cache");
         fs::create_dir_all(&cache_dir)?;
         let forward_client = build_forward_client(&options)?;
+        let async_store = AsyncObjectStore::new(object_store.clone());
         Ok(Self {
             runtime_dir,
             cache_dir,
             object_store,
+            async_store,
             options,
             forward_client,
             forward_trace_seq: Arc::new(AtomicU64::new(1)),
@@ -383,6 +405,8 @@ impl ProjectRuntime {
             runtime_id: new_runtime_id(),
             states: Arc::new(Mutex::new(HashMap::new())),
             notifiers: Arc::new(Mutex::new(HashMap::new())),
+            auth_users: Arc::new(Mutex::new(HashMap::new())),
+            auth_refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -520,6 +544,14 @@ impl ProjectRuntime {
 
     pub fn supabase_project_id(&self) -> &str {
         &self.options.supabase_project_id
+    }
+
+    pub fn auth_users(&self) -> &Arc<Mutex<HashMap<String, serde_json::Value>>> {
+        &self.auth_users
+    }
+
+    pub fn auth_refresh_tokens(&self) -> &Arc<Mutex<HashMap<String, serde_json::Value>>> {
+        &self.auth_refresh_tokens
     }
 
     pub fn routing_info(&self) -> Value {
@@ -812,6 +844,160 @@ impl ProjectRuntime {
                 }
             }
         }
+    }
+
+    fn spawn_lease_renewer(
+        &self,
+        project_id: &str,
+        state: Arc<Mutex<ProjectState>>,
+    ) -> (
+        Option<mpsc::Sender<()>>,
+        Option<std::thread::JoinHandle<()>>,
+    ) {
+        if self.options.writer_lease_ttl_ms == 0 {
+            return (None, None);
+        }
+        let (stop, receiver) = mpsc::channel();
+        let runtime = self.clone();
+        let pid = project_id.to_string();
+        let worker = std::thread::Builder::new()
+            .name(format!("sdb-lease-{pid}"))
+            .spawn(move || runtime.lease_renewer_loop(&pid, state, receiver))
+            .ok();
+        (Some(stop), worker)
+    }
+
+    fn lease_renewer_loop(
+        &self,
+        project_id: &str,
+        state: Arc<Mutex<ProjectState>>,
+        stop: mpsc::Receiver<()>,
+    ) {
+        let ttl_ms = self.options.writer_lease_ttl_ms;
+        let renew_interval = Duration::from_millis((ttl_ms / 3).max(1000));
+        loop {
+            match stop.recv_timeout(renew_interval) {
+                Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let now = now_ms();
+                    let needs_renew = {
+                        let locked = state.lock().unwrap();
+                        if locked.writer_lease_fencing_token.is_none() {
+                            false
+                        } else {
+                            let current = self.load_writer_lease(project_id);
+                            match current {
+                                Ok(Some(lease)) => {
+                                    lease.owner_id == self.runtime_id
+                                        && lease.expires_at_ms
+                                            < now + (ttl_ms as u128 / 2)
+                                }
+                                _ => false,
+                            }
+                        }
+                    };
+                    if needs_renew {
+                        if let Err(err) = self.renew_lease(project_id) {
+                            eprintln!(
+                                "[sdb-lease-{project_id}] renew failed: {err}"
+                            );
+                        }
+                    }
+                    if let Err(err) = self.gc_lease_claims(project_id) {
+                        eprintln!(
+                            "[sdb-lease-{project_id}] GC claims failed: {err}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn renew_lease(&self, project_id: &str) -> Result<(), ApiError> {
+        let now = now_ms();
+        let ttl_ms = self.options.writer_lease_ttl_ms;
+        let key = writer_lease_key(project_id);
+        let current = self.load_writer_lease(project_id)?;
+        let Some(current) = current else {
+            return Ok(());
+        };
+        if current.owner_id != self.runtime_id {
+            self.audit_lease_conflict(
+                project_id,
+                &current,
+                "renew_lease: lease owned by another runtime",
+            );
+            return Err(ApiError::new(
+                423,
+                format!(
+                    "cannot renew lease: owned by another runtime: project_id={project_id}, owner_id={}",
+                    current.owner_id
+                ),
+            ));
+        }
+        let renewed = WriterLease {
+            schema_version: 1,
+            project_id: project_id.to_string(),
+            owner_id: self.runtime_id.clone(),
+            fencing_token: current.fencing_token,
+            acquired_at_ms: current.acquired_at_ms,
+            expires_at_ms: now + ttl_ms as u128,
+        };
+        self.object_store.put_bytes(
+            &key,
+            serde_json::to_vec_pretty(&renewed)?.as_slice(),
+        )?;
+        Ok(())
+    }
+
+    fn gc_lease_claims(&self, project_id: &str) -> Result<u64, ApiError> {
+        let prefix = format!("projects/{project_id}/writer-lease-claims/");
+        let claims = self.object_store.list_prefix(&prefix)?;
+        let now = now_ms();
+        let mut removed = 0u64;
+        for claim in claims {
+            let bytes = self.object_store.read_bytes(&claim.key)?;
+            let lease: WriterLease = match serde_json::from_slice(&bytes) {
+                Ok(l) => l,
+                Err(_) => {
+                    self.object_store.delete(&claim.key).ok();
+                    removed += 1;
+                    continue;
+                }
+            };
+            if lease.expires_at_ms + 3600_000 < now {
+                self.object_store.delete(&claim.key).ok();
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    fn audit_lease_conflict(
+        &self,
+        project_id: &str,
+        lease: &WriterLease,
+        reason: &str,
+    ) {
+        let audit_key = format!(
+            "projects/{project_id}/lease-audit-{}.json",
+            now_ms()
+        );
+        let audit = json!({
+            "project_id": project_id,
+            "runtime_id": self.runtime_id,
+            "lease_owner_id": lease.owner_id,
+            "lease_fencing_token": lease.fencing_token,
+            "lease_expires_at_ms": lease.expires_at_ms,
+            "reason": reason,
+            "audited_at_ms": now_ms(),
+        });
+        self.object_store
+            .put_bytes(
+                &audit_key,
+                serde_json::to_vec_pretty(&audit).unwrap_or_default().as_slice(),
+            )
+            .ok();
     }
 
     fn load_writer_lease(&self, project_id: &str) -> Result<Option<WriterLease>, ApiError> {
@@ -1294,12 +1480,16 @@ impl ProjectRuntime {
             (Some(writer), Some(worker))
         };
         let (replica_stop, replica_worker) = self.spawn_replica_worker(&pid, state.clone())?;
+        let (lease_renewer_stop, lease_renewer_worker) =
+            self.spawn_lease_renewer(&pid, state.clone());
         let handle = Arc::new(ProjectHandle {
             state: state.clone(),
             writer: Mutex::new(writer),
             worker: Mutex::new(worker),
             replica_stop: Mutex::new(replica_stop),
             replica_worker: Mutex::new(replica_worker),
+            lease_renewer_stop: Mutex::new(lease_renewer_stop),
+            lease_renewer_worker: Mutex::new(lease_renewer_worker),
         });
         self.states
             .lock()
@@ -1605,6 +1795,90 @@ impl ProjectRuntime {
         )
     }
 
+    pub fn list_buckets(&self, project_id: &str) -> Result<Value, ApiError> {
+        let handle = self.ensure_project_for_read(project_id, None)?;
+        let state = handle.state.lock().unwrap();
+        let mut stmt = state
+            .conn
+            .prepare("SELECT name, created_at FROM _sdb_buckets ORDER BY name")?;
+        let rows = stmt.query_map([], row_to_json_map)?;
+        let mut buckets = Vec::new();
+        for row in rows {
+            buckets.push(row?);
+        }
+        Ok(json!(buckets))
+    }
+
+    pub fn get_bucket(&self, project_id: &str, name: &str) -> Result<Value, ApiError> {
+        let handle = self.ensure_project_for_read(project_id, None)?;
+        let state = handle.state.lock().unwrap();
+        let bucket = assert_user_ident(name)?;
+        let meta = state
+            .conn
+            .query_row(
+                "SELECT name, created_at FROM _sdb_buckets WHERE name=?",
+                [bucket],
+                row_to_json_map,
+            )
+            .optional()?
+            .ok_or_else(|| ApiError::new(404, "bucket not found"))?;
+        Ok(json!(meta))
+    }
+
+    pub fn delete_bucket(&self, project_id: &str, name: &str) -> Result<Value, ApiError> {
+        self.submit_write(project_id, WriteJobKind::DeleteBucket {
+            name: name.to_string(),
+        })
+    }
+
+    pub fn list_objects(
+        &self,
+        project_id: &str,
+        bucket: &str,
+        prefix: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Value, ApiError> {
+        let handle = self.ensure_project_for_read(project_id, None)?;
+        let state = handle.state.lock().unwrap();
+        let bucket = assert_user_ident(bucket)?;
+        let limit = limit.clamp(1, 1000);
+        let offset = offset.max(0);
+        let rows = if let Some(prefix) = prefix {
+            let pattern = format!("{}%", prefix);
+            let mut stmt = state.conn.prepare(
+                "SELECT bucket, object_key AS key, size, content_type, etag, owner_id, created_at, updated_at
+                 FROM _sdb_objects WHERE bucket=? AND state='committed' AND object_key LIKE ? 
+                 ORDER BY object_key LIMIT ? OFFSET ?",
+            )?;
+            let mapped = stmt.query_map(
+                rusqlite::params![bucket, pattern, limit, offset],
+                row_to_json_map,
+            )?;
+            let mut v = Vec::new();
+            for r in mapped {
+                v.push(r?);
+            }
+            v
+        } else {
+            let mut stmt = state.conn.prepare(
+                "SELECT bucket, object_key AS key, size, content_type, etag, owner_id, created_at, updated_at
+                 FROM _sdb_objects WHERE bucket=? AND state='committed'
+                 ORDER BY object_key LIMIT ? OFFSET ?",
+            )?;
+            let mapped = stmt.query_map(
+                rusqlite::params![bucket, limit, offset],
+                row_to_json_map,
+            )?;
+            let mut v = Vec::new();
+            for r in mapped {
+                v.push(r?);
+            }
+            v
+        };
+        Ok(json!(rows))
+    }
+
     pub fn put_object(
         &self,
         project_id: &str,
@@ -1654,7 +1928,7 @@ impl ProjectRuntime {
         let meta = state
             .conn
             .query_row(
-                "SELECT bucket, object_key AS key, size, content_type, etag, owner_id, created_at, updated_at FROM _sdb_objects WHERE bucket=? AND object_key=?",
+                "SELECT bucket, object_key AS key, size, content_type, etag, owner_id, created_at, updated_at FROM _sdb_objects WHERE bucket=? AND object_key=? AND state='committed'",
                 (bucket, key),
                 row_to_json_map,
             )
@@ -1679,6 +1953,90 @@ impl ProjectRuntime {
             meta: Value::Object(meta),
             data,
         })
+    }
+
+    pub async fn get_object_async(
+        &self,
+        project_id: &str,
+        bucket: &str,
+        key: &str,
+        actor: &Actor,
+    ) -> Result<ObjectRead, ApiError> {
+        let (meta, storage_key) = {
+            let handle = self.ensure_project_for_read(project_id, None)?;
+            let state = handle.state.lock().unwrap();
+            let bucket = assert_user_ident(bucket)?.to_string();
+            let key = safe_object_key(key)?.to_string();
+            let meta = state
+                .conn
+                .query_row(
+                    "SELECT bucket, object_key AS key, size, content_type, etag, owner_id, created_at, updated_at FROM _sdb_objects WHERE bucket=? AND object_key=? AND state='committed'",
+                    (bucket.as_str(), key.as_str()),
+                    row_to_json_map,
+                )
+                .optional()?
+                .ok_or_else(|| ApiError::new(404, "object not found"))?;
+            if !actor.is_admin() {
+                let owner_id = meta.get("owner_id").and_then(Value::as_str).unwrap_or("");
+                if !owner_id.is_empty() {
+                    if let Some(sub) = &actor.sub {
+                        if sub != owner_id {
+                            return Err(ApiError::new(403, "access denied: object not owned by actor"));
+                        }
+                    } else {
+                        return Err(ApiError::new(403, "access denied: anonymous access to owned object"));
+                    }
+                }
+            }
+            let skey = storage_key(&state.project_id, &bucket, &key);
+            (Value::Object(meta), skey)
+        };
+        let data = self
+            .async_store
+            .read_bytes(storage_key)
+            .await
+            .map_err(|err| ApiError::new(503, format!("failed to read object: {err}")))?;
+        Ok(ObjectRead { meta, data })
+    }
+
+    pub async fn list_buckets_async(&self, project_id: &str) -> Result<Value, ApiError> {
+        let runtime = self.clone();
+        let project_id = project_id.to_string();
+        tokio::task::spawn_blocking(move || runtime.list_buckets(&project_id))
+            .await
+            .map_err(|err| ApiError::new(500, format!("list_buckets_async join error: {err}")))?
+    }
+
+    pub async fn get_bucket_async(
+        &self,
+        project_id: &str,
+        bucket: &str,
+    ) -> Result<Value, ApiError> {
+        let runtime = self.clone();
+        let project_id = project_id.to_string();
+        let bucket = bucket.to_string();
+        tokio::task::spawn_blocking(move || runtime.get_bucket(&project_id, &bucket))
+            .await
+            .map_err(|err| ApiError::new(500, format!("get_bucket_async join error: {err}")))?
+    }
+
+    pub async fn list_objects_async(
+        &self,
+        project_id: &str,
+        bucket: &str,
+        prefix: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Value, ApiError> {
+        let runtime = self.clone();
+        let project_id = project_id.to_string();
+        let bucket = bucket.to_string();
+        let prefix = prefix.map(|p| p.to_string());
+        tokio::task::spawn_blocking(move || {
+            runtime.list_objects(&project_id, &bucket, prefix.as_deref(), limit, offset)
+        })
+        .await
+        .map_err(|err| ApiError::new(500, format!("list_objects_async join error: {err}")))?
     }
 
     pub fn delete_object(
@@ -2080,6 +2438,24 @@ impl ProjectRuntime {
                 .map(|value| (value, true)),
             WriteJobKind::DeleteObject { bucket, key, actor } => {
                 self.execute_delete_object(state, &bucket, &key, &actor)
+            }
+            WriteJobKind::DeleteBucket { name } => {
+                (|| {
+                    let bucket = assert_user_ident(&name)?;
+                    let tx = state.conn.transaction()?;
+                    let count: i64 = tx.query_row(
+                        "SELECT COUNT(*) FROM _sdb_objects WHERE bucket=? AND state='committed'",
+                        [&bucket],
+                        |row| row.get(0),
+                    )?;
+                    if count > 0 {
+                        return Err(ApiError::new(409, "bucket not empty"));
+                    }
+                    tx.execute("DELETE FROM _sdb_buckets WHERE name=?", [&bucket])?;
+                    tx.commit()?;
+                    Ok(json!({ "deleted": true }))
+                })()
+                .map(|value| (value, true))
             }
         };
         match result {
@@ -2535,11 +2911,11 @@ impl ProjectRuntime {
         let tx = state.conn.transaction()?;
         tx.execute(
             "
-            INSERT INTO _sdb_objects(bucket, object_key, size, content_type, etag, owner_id, created_at, updated_at)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO _sdb_objects(bucket, object_key, size, content_type, etag, owner_id, state, created_at, updated_at)
+            VALUES(?, ?, ?, ?, ?, ?, 'committed', ?, ?)
             ON CONFLICT(bucket, object_key)
             DO UPDATE SET size=excluded.size, content_type=excluded.content_type, etag=excluded.etag,
-                          owner_id=excluded.owner_id, updated_at=excluded.updated_at
+                          owner_id=excluded.owner_id, state='committed', updated_at=excluded.updated_at
             ",
             (
                 bucket,
@@ -2574,7 +2950,7 @@ impl ProjectRuntime {
         let meta = state
             .conn
             .query_row(
-                "SELECT bucket, object_key AS key, size, content_type, etag, owner_id, created_at, updated_at FROM _sdb_objects WHERE bucket=? AND object_key=?",
+                "SELECT bucket, object_key AS key, size, content_type, etag, owner_id, created_at, updated_at FROM _sdb_objects WHERE bucket=? AND object_key=? AND state IN ('committed', 'pending')",
                 (bucket, key),
                 row_to_json_map,
             )
@@ -2582,14 +2958,62 @@ impl ProjectRuntime {
             .ok_or_else(|| ApiError::new(404, "object not found"))?;
         let tx = state.conn.transaction()?;
         tx.execute(
-            "DELETE FROM _sdb_objects WHERE bucket=? AND object_key=?",
+            "UPDATE _sdb_objects SET state='deleting', updated_at=datetime('now') WHERE bucket=? AND object_key=?",
             (bucket, key),
         )?;
         record_event(&tx, "_sdb_objects", "storage_delete", &meta, actor)?;
         tx.commit()?;
         self.object_store
             .delete(&storage_key(&state.project_id, bucket, key))?;
+        let tx = state.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM _sdb_objects WHERE bucket=? AND object_key=? AND state='deleting'",
+            (bucket, key),
+        )?;
+        tx.commit()?;
         Ok((json!({ "deleted": true }), true))
+    }
+
+    pub fn reconcile_storage_gc(&self, project_id: &str) -> Result<Value, ApiError> {
+        let handle = self.ensure_project_for_read(project_id, None)?;
+        let state = handle.state.lock().unwrap();
+        let stale: Vec<(String, String)> = state
+            .conn
+            .prepare("SELECT bucket, object_key FROM _sdb_objects WHERE state='deleting'")?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut cleaned = 0;
+        for (bucket, key) in &stale {
+            if self
+                .object_store
+                .delete(&storage_key(&state.project_id, bucket, key))
+                .is_ok()
+            {
+                state.conn.execute(
+                    "DELETE FROM _sdb_objects WHERE bucket=? AND object_key=? AND state='deleting'",
+                    (bucket, key),
+                )?;
+                cleaned += 1;
+            }
+        }
+        let orphaned: Vec<(String, String)> = state
+            .conn
+            .prepare("SELECT bucket, object_key FROM _sdb_objects WHERE state='pending'")?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut purged = 0;
+        for (bucket, key) in &orphaned {
+            state.conn.execute(
+                "DELETE FROM _sdb_objects WHERE bucket=? AND object_key=? AND state='pending'",
+                (bucket, key),
+            )?;
+            purged += 1;
+        }
+        Ok(json!({ "cleaned_deleting": cleaned, "purged_pending": purged }))
     }
 
     fn ensure_meta(&self, conn: &Connection) -> Result<(), ApiError> {
@@ -2615,6 +3039,7 @@ impl ProjectRuntime {
                 content_type TEXT NOT NULL,
                 etag TEXT NOT NULL,
                 owner_id TEXT,
+                state TEXT NOT NULL DEFAULT 'committed',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(bucket, object_key),
@@ -2668,6 +3093,9 @@ impl ProjectRuntime {
             schema_version: 1,
             project_id: state.project_id.clone(),
             generation: next_generation,
+            previous_generation: state.generation,
+            fencing_token: state.writer_lease_fencing_token,
+            owner_id: Some(self.runtime_id.clone()),
             commit_seq: state.commit_seq,
             bookmark: bookmark_for_seq(state.commit_seq),
             updated_at: utc_now(),
@@ -2824,6 +3252,9 @@ impl ProjectRuntime {
             schema_version: 1,
             project_id: state.project_id.clone(),
             generation: state.generation,
+            previous_generation: state.generation.saturating_sub(1),
+            fencing_token: state.writer_lease_fencing_token,
+            owner_id: Some(self.runtime_id.clone()),
             commit_seq: state.commit_seq,
             bookmark: bookmark_for_seq(state.commit_seq),
             updated_at: utc_now(),
@@ -2841,6 +3272,17 @@ impl ProjectRuntime {
     }
 
     fn put_manifest(&self, manifest: &DurableManifest) -> Result<(), ApiError> {
+        if let Ok(Some(existing)) = self.load_manifest(&manifest.project_id) {
+            if existing.generation > manifest.generation {
+                return Err(ApiError::new(
+                    409,
+                    format!(
+                        "manifest generation regression: existing={}, attempted={}; possible split-brain or stale writer",
+                        existing.generation, manifest.generation
+                    ),
+                ));
+            }
+        }
         self.object_store.put_bytes(
             &manifest_key(&manifest.project_id),
             serde_json::to_vec_pretty(&manifest)?.as_slice(),
@@ -4619,5 +5061,74 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(tables.contains(&"notes"));
         assert!(!tables.contains(&"rejected_notes"));
+    }
+
+    #[test]
+    fn lease_renewer_extends_expiry() {
+        let (dir, first, _second) = shared_runtime_pair(60_000);
+        setup_notes(&first);
+        first
+            .insert_row("demo", "notes", json!({"owner_id":"alice","title":"first"}), &actor("alice"))
+            .unwrap();
+
+        let lease_before = first.load_writer_lease("demo").unwrap().unwrap();
+        assert_eq!(lease_before.owner_id, first.runtime_id);
+
+        first.renew_lease("demo").unwrap();
+        let lease_after = first.load_writer_lease("demo").unwrap().unwrap();
+        assert!(lease_after.expires_at_ms >= lease_before.expires_at_ms);
+        assert_eq!(lease_after.fencing_token, lease_before.fencing_token);
+
+        let _ = dir;
+    }
+
+    #[test]
+    fn gc_lease_claims_removes_expired() {
+        let (_dir, first, _second) = shared_runtime_pair(60_000);
+        setup_notes(&first);
+        first
+            .insert_row("demo", "notes", json!({"owner_id":"alice","title":"first"}), &actor("alice"))
+            .unwrap();
+
+        let claim_key = writer_lease_claim_key("demo", 999);
+        let stale_lease = WriterLease {
+            schema_version: 1,
+            project_id: "demo".to_string(),
+            owner_id: "stale-runtime".to_string(),
+            fencing_token: 999,
+            acquired_at_ms: 0,
+            expires_at_ms: 1,
+        };
+        first
+            .object_store
+            .put_bytes(&claim_key, serde_json::to_vec_pretty(&stale_lease).unwrap().as_slice())
+            .unwrap();
+
+        let removed = first.gc_lease_claims("demo").unwrap();
+        assert!(removed >= 1, "expected at least 1 claim removed, got {removed}");
+        assert!(!first.object_store.exists(&claim_key).unwrap());
+    }
+
+    #[test]
+    fn lease_conflict_audit_writes_record() {
+        let (_dir, first, _second) = shared_runtime_pair(60_000);
+        setup_notes(&first);
+
+        let other_lease = WriterLease {
+            schema_version: 1,
+            project_id: "demo".to_string(),
+            owner_id: "other-runtime".to_string(),
+            fencing_token: 42,
+            acquired_at_ms: 0,
+            expires_at_ms: now_ms() + 60_000,
+        };
+        first.audit_lease_conflict("demo", &other_lease, "test conflict");
+
+        let all_files = first.object_store.list_prefix("projects/demo").unwrap();
+        let audit_files: Vec<_> = all_files
+            .iter()
+            .filter(|f| f.key.contains("lease-audit-"))
+            .collect();
+        assert_eq!(audit_files.len(), 1, "expected 1 audit record, got {}", audit_files.len());
     }
 }

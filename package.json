@@ -19,7 +19,9 @@
     "core:s3-http-fault-injection": "bash scripts/s3-http-fault-injection.sh",
     "core:s3-retry-idempotency": "bash scripts/s3-retry-idempotency.sh",
     "core:crash-matrix": "cargo run --release --manifest-path rust-core/Cargo.toml --bin crash_matrix --",
-    "supabase:compat": "node scripts/supabase-compat-check.mjs"
+    "supabase:compat": "node scripts/supabase-compat-check.mjs",
+    "test:sdk": "node --test tests/supabase-sdk.test.mjs",
+    "example:blog": "node examples/blog-app/app.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.108.2",

@@ -33,6 +33,51 @@ pub trait ObjectStore: Send + Sync {
     fn list_prefix(&self, prefix: &str) -> anyhow::Result<Vec<ObjectMeta>>;
 }
 
+#[derive(Clone)]
+pub struct AsyncObjectStore {
+    inner: ObjectStoreRef,
+}
+
+impl AsyncObjectStore {
+    pub fn new(inner: ObjectStoreRef) -> Self {
+        Self { inner }
+    }
+
+    pub fn inner(&self) -> &ObjectStoreRef {
+        &self.inner
+    }
+
+    pub async fn read_bytes(&self, key: String) -> anyhow::Result<Vec<u8>> {
+        let store = self.inner.clone();
+        tokio::task::spawn_blocking(move || store.read_bytes(&key)).await?
+    }
+
+    pub async fn exists(&self, key: String) -> anyhow::Result<bool> {
+        let store = self.inner.clone();
+        tokio::task::spawn_blocking(move || store.exists(&key)).await?
+    }
+
+    pub async fn len(&self, key: String) -> anyhow::Result<Option<u64>> {
+        let store = self.inner.clone();
+        tokio::task::spawn_blocking(move || store.len(&key)).await?
+    }
+
+    pub async fn put_bytes(&self, key: String, data: Vec<u8>) -> anyhow::Result<()> {
+        let store = self.inner.clone();
+        tokio::task::spawn_blocking(move || store.put_bytes(&key, &data)).await?
+    }
+
+    pub async fn delete(&self, key: String) -> anyhow::Result<()> {
+        let store = self.inner.clone();
+        tokio::task::spawn_blocking(move || store.delete(&key)).await?
+    }
+
+    pub async fn list_prefix(&self, prefix: String) -> anyhow::Result<Vec<ObjectMeta>> {
+        let store = self.inner.clone();
+        tokio::task::spawn_blocking(move || store.list_prefix(&prefix)).await?
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LocalObjectStore {
     base_dir: PathBuf,
@@ -562,5 +607,68 @@ pub mod s3 {
             || rendered.contains("pre-condition")
             || rendered.contains("statuscode(412)")
             || rendered.contains("status: 412")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn async_object_store_put_read_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let local: ObjectStoreRef = Arc::new(LocalObjectStore::new(dir.path()).unwrap());
+        let async_store = AsyncObjectStore::new(local);
+
+        async_store
+            .put_bytes("foo/bar.bin".to_string(), vec![1, 2, 3, 4])
+            .await
+            .unwrap();
+
+        assert!(async_store.exists("foo/bar.bin".to_string()).await.unwrap());
+        assert!(!async_store.exists("foo/missing".to_string()).await.unwrap());
+
+        let data = async_store
+            .read_bytes("foo/bar.bin".to_string())
+            .await
+            .unwrap();
+        assert_eq!(data, vec![1, 2, 3, 4]);
+
+        let len = async_store.len("foo/bar.bin".to_string()).await.unwrap();
+        assert_eq!(len, Some(4));
+
+        async_store
+            .delete("foo/bar.bin".to_string())
+            .await
+            .unwrap();
+        assert!(!async_store.exists("foo/bar.bin".to_string()).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn async_object_store_list_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let local: ObjectStoreRef = Arc::new(LocalObjectStore::new(dir.path()).unwrap());
+        let async_store = AsyncObjectStore::new(local);
+
+        async_store
+            .put_bytes("a/1.bin".to_string(), vec![1])
+            .await
+            .unwrap();
+        async_store
+            .put_bytes("a/2.bin".to_string(), vec![2])
+            .await
+            .unwrap();
+        async_store
+            .put_bytes("b/3.bin".to_string(), vec![3])
+            .await
+            .unwrap();
+
+        let objects = async_store
+            .list_prefix("a".to_string())
+            .await
+            .unwrap();
+        assert_eq!(objects.len(), 2);
+        assert_eq!(objects[0].key, "a/1.bin");
+        assert_eq!(objects[1].key, "a/2.bin");
     }
 }

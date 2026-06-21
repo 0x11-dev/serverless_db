@@ -1,6 +1,8 @@
 services:
   rustfs:
-    image: rustfs/rustfs:latest
+    # Pin to specific version instead of :latest for reproducibility
+    # For production, pin with digest: rustfs/rustfs:v0.1.7@sha256:<digest>
+    image: rustfs/rustfs:v0.1.7
     command: /data
     environment:
       RUSTFS_ACCESS_KEY: ${S3_ROOT_USER:?set S3_ROOT_USER in .env}
@@ -14,7 +16,9 @@ services:
       retries: 30
 
   create-bucket:
-    image: amazon/aws-cli
+    # Pin to specific version; for production, pin with digest:
+    # amazon/aws-cli:2.17.42@sha256:<digest>
+    image: amazon/aws-cli:2.17.42
     depends_on:
       rustfs:
         condition: service_healthy
@@ -200,6 +204,38 @@ services:
       interval: 5s
       timeout: 3s
       retries: 30
+
+  blog-example:
+    # Pin to specific version; for production, pin with digest:
+    # node:22-bookworm-slim@sha256:<digest>
+    image: node:22.11.0-bookworm-slim
+    depends_on:
+      primary:
+        condition: service_healthy
+      replica-a:
+        condition: service_healthy
+      replica-b:
+        condition: service_healthy
+    environment:
+      SDB_BASE_URL: http://primary:8765
+      SDB_REPLICA_URLS: http://replica-a:8765,http://replica-b:8765
+      SDB_JWT_SECRET: ${SDB_JWT_SECRET:?set SDB_JWT_SECRET in .env}
+      SDB_PROJECT_ID: ${SDB_PROJECT_ID:-blog-app}
+      SDB_ENV: production
+      SDB_REPORT_DIR: /reports
+    volumes:
+      - ../examples/blog-app:/app:ro
+      - ../reports:/reports
+      - ../package.json:/package.json:ro
+      - ../package-lock.json:/package-lock.json:ro
+      - ../node_modules:/node_modules:ro
+    working_dir: /app
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        cd / && npm install --omit=dev --no-save
+        node /app/app.mjs
 
 volumes:
   rustfs-data:

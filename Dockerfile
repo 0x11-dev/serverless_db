@@ -1,4 +1,4 @@
-FROM docker.1panel.live/library/rust:1-bookworm AS build
+FROM docker.1panel.live/library/rust:1.83.0-bookworm AS build
 
 WORKDIR /app
 RUN mkdir -p /usr/local/cargo \
@@ -20,7 +20,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --manifest-path rust-core/Cargo.toml --features s3 --bin serverless-db-core \
     && cp rust-core/target/release/serverless-db-core /tmp/serverless-db-core
 
-FROM docker.1panel.live/library/debian:bookworm-slim
+FROM docker.1panel.live/library/debian:bookworm-20241202-slim
 
 RUN sed -i 's|http://deb.debian.org/debian|http://mirrors.aliyun.com/debian|g; s|http://deb.debian.org/debian-security|http://mirrors.aliyun.com/debian-security|g' /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true \
     && apt-get update \

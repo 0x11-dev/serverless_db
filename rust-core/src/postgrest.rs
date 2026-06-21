@@ -22,6 +22,7 @@ pub enum FilterOp {
     In,
     Is,
     Like,
+    Ilike,
 }
 
 #[derive(Debug, Clone)]
@@ -29,6 +30,7 @@ pub enum FilterExpr {
     Condition(FilterCondition),
     And(Vec<FilterExpr>),
     Or(Vec<FilterExpr>),
+    Not(Box<FilterExpr>),
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +158,7 @@ fn parse_op(op_str: &str) -> Result<FilterOp, ParseError> {
         "in" => Ok(FilterOp::In),
         "is" => Ok(FilterOp::Is),
         "like" => Ok(FilterOp::Like),
+        "ilike" => Ok(FilterOp::Ilike),
         other => Err(ParseError(format!("unsupported filter operator: {other}"))),
     }
 }
@@ -178,9 +181,54 @@ fn parse_condition(key: &str, value: &str) -> Result<FilterCondition, ParseError
             value: filter_value.to_string(),
         });
     }
+    for op_str in ["neq", "gt", "gte", "lt", "lte", "in", "is", "like", "ilike"] {
+        if let Some(rest) = value.strip_prefix(&format!("{op_str}.")) {
+            let op = parse_op(op_str)?;
+            return Ok(FilterCondition {
+                column: key.to_string(),
+                op,
+                value: rest.to_string(),
+            });
+        }
+    }
     Err(ParseError(format!(
-        "filter for {key} must use format column.op=value or key=eq.value"
+        "filter for {key} must use format column.op=value or key=op.value"
     )))
+}
+
+fn parse_filter_entry(key: &str, value: &str) -> Result<FilterExpr, ParseError> {
+    if let Some(rest) = value.strip_prefix("not.") {
+        let cond = parse_condition(key, rest)?;
+        return Ok(FilterExpr::Not(Box::new(FilterExpr::Condition(cond))));
+    }
+    Ok(FilterExpr::Condition(parse_condition(key, value)?))
+}
+
+fn parse_or_segment(part: &str) -> Result<FilterExpr, ParseError> {
+    let part = part.trim();
+    if let Some(eq_pos) = part.find('=') {
+        let key = &part[..eq_pos];
+        let val = &part[eq_pos + 1..];
+        return Ok(FilterExpr::Condition(parse_condition(key, val)?));
+    }
+    let parts: Vec<&str> = part.splitn(3, '.').collect();
+    if parts.len() >= 3 {
+        let column = parts[0];
+        let op = parts[1];
+        let value = parts[2..].join(".");
+        let cond = parse_condition(&format!("{column}.{op}"), &value)?;
+        return Ok(FilterExpr::Condition(cond));
+    }
+    if parts.len() == 2 {
+        let column = parts[0];
+        let value = parts[1];
+        return Ok(FilterExpr::Condition(FilterCondition {
+            column: column.to_string(),
+            op: FilterOp::Eq,
+            value: value.to_string(),
+        }));
+    }
+    Err(ParseError(format!("invalid or filter segment: {part}")))
 }
 
 fn parse_or_expr(value: &str) -> Result<FilterExpr, ParseError> {
@@ -190,16 +238,7 @@ fn parse_or_expr(value: &str) -> Result<FilterExpr, ParseError> {
     }
     let conditions: Vec<FilterExpr> = parts
         .iter()
-        .map(|part| {
-            let part = part.trim();
-            if let Some(eq_pos) = part.find('=') {
-                let key = &part[..eq_pos];
-                let val = &part[eq_pos + 1..];
-                Ok(FilterExpr::Condition(parse_condition(key, val)?))
-            } else {
-                Err(ParseError(format!("invalid or filter segment: {part}")))
-            }
-        })
+        .map(|part| parse_or_segment(part))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(FilterExpr::Or(conditions))
 }
@@ -255,7 +294,7 @@ pub fn parse_query_params(
                 filter_conditions.push(FilterExpr::And(conditions));
             }
             _ => {
-                filter_conditions.push(FilterExpr::Condition(parse_condition(key, value)?));
+                filter_conditions.push(parse_filter_entry(key, value)?);
             }
         }
     }
@@ -304,6 +343,10 @@ pub fn compile_filters(
             }
             Ok((clauses.join(" OR "), params))
         }
+        FilterExpr::Not(inner) => {
+            let (sql, params) = compile_filters(inner)?;
+            Ok((format!("NOT ({sql})"), params))
+        }
     }
 }
 
@@ -317,8 +360,10 @@ fn compile_condition(cond: &FilterCondition) -> Result<(String, Vec<SqlValue>), 
         FilterOp::Lt => Ok((format!("{column} < ?"), vec![SqlValue::Text(cond.value.clone())])),
         FilterOp::Lte => Ok((format!("{column} <= ?"), vec![SqlValue::Text(cond.value.clone())])),
         FilterOp::Like => Ok((format!("{column} LIKE ?"), vec![SqlValue::Text(cond.value.clone())])),
+        FilterOp::Ilike => Ok((format!("{column} LIKE ? COLLATE NOCASE"), vec![SqlValue::Text(cond.value.clone())])),
         FilterOp::In => {
-            let values: Vec<&str> = cond.value.split(',').map(|s| s.trim()).collect();
+            let cleaned = cond.value.trim_start_matches('(').trim_end_matches(')');
+            let values: Vec<&str> = cleaned.split(',').map(|s| s.trim()).collect();
             if values.is_empty() {
                 return Ok(("0=1".to_string(), Vec::new()));
             }
